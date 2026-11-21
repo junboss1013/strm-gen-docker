@@ -214,8 +214,15 @@ def trigger_scan(cfg):
 def main():
     cfg = load_config()
     login(cfg)
-    subprocess.run(["rm", "-rf", OUT_ROOT], check=True)
+    # OUT_ROOT 通常是挂载卷，不能直接删除目录本身（Resource busy），只清空其内容
     os.makedirs(OUT_ROOT, exist_ok=True)
+    for entry in os.listdir(OUT_ROOT):
+        p = os.path.join(OUT_ROOT, entry)
+        if os.path.isdir(p) and not os.path.islink(p):
+            import shutil
+            shutil.rmtree(p)
+        else:
+            os.remove(p)
     total = 0
     for m in cfg["mappings"]:
         n = process(cfg, m, OUT_ROOT)
