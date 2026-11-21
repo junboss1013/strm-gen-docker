@@ -5,7 +5,7 @@
 #   docker compose up -d strm-gen           # cron 常驻模式（需取消下面 CRON 注释）
 services:
   strm-gen:
-    image: junboss1013/strm-gen:latest
+    image: ghcr.io/junboss1013/strm-gen:latest
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
     # image: strm-gen:local
