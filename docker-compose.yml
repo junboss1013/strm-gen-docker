@@ -1,0 +1,46 @@
+# 小雅 Alist → Emby strm 生成器
+#
+# 拉取后只需改 environment 里的 MAPPINGS（加目录 = 加一条映射），然后：
+#   docker compose run --rm strm-gen        # 手动跑一次
+#   docker compose up -d strm-gen           # cron 常驻模式（需取消下面 CRON 注释）
+services:
+  strm-gen:
+    image: junboss1013/strm-gen:latest
+    # 本地改完代码想自用时，改用下面两行代替 image：
+    # build: .
+    # image: strm-gen:local
+
+    # host 网络：容器内 127.0.0.1:5678 即宿主机的小雅 Alist
+    network_mode: host
+
+    environment:
+      # ---- Alist（内网地址，host 网络下用 127.0.0.1）----
+      ALIST_BASE: "http://127.0.0.1:5678"
+      ALIST_USERNAME: "wxs"
+      ALIST_PASSWORD: "Wu961013@"
+
+      # ---- strm 直链前缀（播放器实际访问的公网 Alist 地址）----
+      PUBLIC_PREFIX: "https://xiaoya.10131127.xyz:15617"
+
+      # ---- Emby（用于触发媒体库刷新，可留空则跳过刷新）----
+      EMBY_PUBLIC: "https://xemby.10131127.xyz:15617"
+      EMBY_API_KEY: "a0000939efe14af6a40d024cf8f827fe"
+      EMBY_CONTAINER: "emby"
+      AUTO_SCAN: "true"
+
+      # ---- 定时（可选）：取消注释后容器常驻，按 cron 执行 ----
+      # CRON: "0 3 * * *"
+
+      # ---- 目录映射：加新目录就在这里加一条 ----
+      # type 取 movie 或 tv；emby_path 必须是 Emby 媒体库已扫描的路径
+      MAPPINGS: >-
+        [
+          {"alist_path":"/🥝115网盘/115/影视库/电影","type":"movie","emby_path":"/media/115/电影"},
+          {"alist_path":"/🥝115网盘/115/影视库/电视剧","type":"tv","emby_path":"/media/115/电视剧"}
+        ]
+
+    volumes:
+      # 写入 Emby 容器媒体库（其 /media 是容器内层叠镜像，必须走 docker.sock + tar）
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 运行日志持久
+      - ./strmgen-out:/out
