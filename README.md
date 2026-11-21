@@ -8,9 +8,11 @@
 
 ## 快速开始
 
+镜像托管在 **GitHub Container Registry（ghcr.io）**，用 GitHub 登录即可，公开包拉取免登录。
+
 ```bash
-# 1. 拉取镜像
-docker pull junboss1013/strm-gen:latest
+# 1. 拉取镜像（公开后无需 docker login）
+docker pull ghcr.io/junboss1013/strm-gen:latest
 
 # 2. 下载 compose
 curl -O https://raw.githubusercontent.com/junboss1013/strm-gen-docker/main/docker-compose.yml
@@ -20,6 +22,8 @@ curl -O https://raw.githubusercontent.com/junboss1013/strm-gen-docker/main/docke
 # 4. 跑一次（生成 strm 并同步进 Emby）
 docker compose run --rm strm-gen
 ```
+
+> 若拉取提示 `denied`：说明包还是私有。到 GitHub 仓库页面 → 右侧 **Packages** → 点 `strm-gen` → **Package settings** → **Change visibility** → **Public**。设为公开后即可免登录拉取。（一次性操作）
 
 ## 配置项（全部走环境变量）
 
