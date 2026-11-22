@@ -1,17 +1,20 @@
 # 小雅 Alist → Emby strm 生成器
 #
-# 拉取后只需改 environment 里的 MAPPINGS（加目录 = 加一条映射），然后：
-#   docker compose run --rm strm-gen        # 手动跑一次
-#   docker compose up -d strm-gen           # cron 常驻模式（需取消下面 CRON 注释）
+# 常驻定时模式（推荐）：docker compose up -d strm-gen   # 按 CRON 每天自动同步
+# 手动跑一次：        docker compose run --rm strm-gen
+# 加新目录：只改下方 environment 里的 MAPPINGS（加一条映射），不用改代码
 services:
   strm-gen:
-    image: ghcr.io/junboss1013/strm-gen:latest
+    container_name: strm-gen
+    image: bossjun/strm-gen:latest
+    # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
     # image: strm-gen:local
 
     # host 网络：容器内 127.0.0.1:5678 即宿主机的小雅 Alist
     network_mode: host
+    restart: unless-stopped
 
     environment:
       # ---- Alist（内网地址，host 网络下用 127.0.0.1）----
@@ -28,8 +31,13 @@ services:
       EMBY_CONTAINER: "emby"
       AUTO_SCAN: "true"
 
-      # ---- 定时（可选）：取消注释后容器常驻，按 cron 执行 ----
-      # CRON: "0 3 * * *"
+      # ---- 时区（影响 CRON 按本地时间执行）----
+      TZ: "Asia/Shanghai"
+
+      # ---- 定时自动同步：5 段 cron（分 时 日 月 周）----
+      # 设了 CRON 容器即常驻并按点执行；注释掉则只手动跑
+      # 例："0 3 * * *" 每天 03:00；"*/30 * * * *" 每 30 分钟
+      CRON: "0 3 * * *"
 
       # ---- 目录映射：加新目录就在这里加一条 ----
       # type 取 movie 或 tv；emby_path 必须是 Emby 媒体库已扫描的路径
