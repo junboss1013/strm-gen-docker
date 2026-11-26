@@ -183,8 +183,24 @@ def process(cfg, mapping, root):
 
 
 def sync_to_emby(cfg, root):
-    """tar 管道经 docker exec 解包进 Emby 容器根目录，写入 /media/...。"""
+    """tar 管道经 docker exec 解包进 Emby 容器根目录，写入 /media/...。
+
+    解包前先清理容器内由本工具管理的目标目录（MAPPINGS 的 emby_path），
+    避免历史遗留的「目录位置是文件」脏数据导致 tar 解包失败、整批 strm 同步不进去。
+    """
     container = cfg["emby_container"]
+    # 收集所有 emby_path 的顶层管理目录（如 /media/115/电影、/media/115/电视剧）
+    targets = set()
+    for m in cfg.get("mappings", []):
+        p = str(m.get("emby_path", "")).strip()
+        if p.startswith("/"):
+            targets.add("/" + p.strip("/"))
+    for p in sorted(targets):
+        # 先删干净（含被误写成文件的同名项），tar 会重建
+        subprocess.run(
+            ["docker", "exec", container, "rm", "-rf", p],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     tar = subprocess.Popen(
         ["tar", "-cf", "-", "-C", root, "."],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
