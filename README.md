@@ -36,8 +36,30 @@ docker compose run --rm strm-gen
 | `EMBY_CONTAINER` | Emby 容器名 | `emby` |
 | `AUTO_SCAN` | 生成后是否触发 Emby 刷新 | `true` |
 | `CRON` | 定时表达式，如 `0 3 * * *`；设置后容器常驻 | 空（单次运行） |
+| `WEBHOOK_ENABLED` | `true` 开启 webhook 实时刷新服务（常驻 HTTP） | `false` |
+| `WEBHOOK_PORT` | webhook 监听端口（host 网络下即宿主机端口，勿与 5678 冲突） | `5679` |
+| `WEBHOOK_TOKEN` | 调用鉴权 token，请求头 `X-Webhook-Token` 或 `?token=` | 空（不鉴权，不安全） |
+| `WEBHOOK_DELAY` | 触发前延迟秒数，给离线下载/网盘索引留时间 | `0` |
 | `MAPPINGS` | 目录映射 JSON 数组（见下） | 必填 |
 | `CONFIG_FILE` | 可选：挂载 config.json 并用此变量指向，代替环境变量 | 空 |
+
+## Webhook 实时刷新（配合教父插件）
+
+容器常驻一个轻量 HTTP 服务，收到请求立即触发一次 strm 扫描 + 写 Emby + 刷新媒体库，
+解决「转存到 115 后要等到 cron 点才刷进 Emby」的问题。可与 `CRON` 同时开启（webhook 实时 + cron 兜底）。
+
+```bash
+# 触发同步（带 token）
+curl -X POST "http://<宿主机IP>:5679/refresh?path=青春共体" \
+     -H "X-Webhook-Token: strmrefresh2026"
+# 健康检查
+curl "http://<宿主机IP>:5679/health"
+```
+
+- 收到请求后立即返回 `{"status":"accepted"}`，扫描在后台异步执行（带文件锁，防与 cron 并发冲突）。
+- `<宿主机IP>`：插件容器若也是 host 网络可用 `127.0.0.1`；否则填宿主机局域网 IP。
+- 教父转存插件/订阅插件转存成功后会自动 POST 这个地址（在插件配置里填 webhook 地址与 token）。
+- 115 **离线下载**是异步任务，文件真正到位可能要几分钟；可把 `WEBHOOK_DELAY` 设为 30~60 秒。
 
 ### MAPPINGS 格式
 

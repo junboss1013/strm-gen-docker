@@ -10,6 +10,8 @@ RUN pip3 install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple requ
 
 WORKDIR /app
 COPY gen_strm.py /app/gen_strm.py
+COPY run_sync.py /app/run_sync.py
+COPY webhook_server.py /app/webhook_server.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

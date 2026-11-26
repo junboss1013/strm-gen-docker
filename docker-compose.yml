@@ -39,6 +39,14 @@ services:
       # 例："0 3 * * *" 每天 03:00；"*/30 * * * *" 每 30 分钟
       CRON: "0 3 * * *"
 
+      # ---- Webhook 实时刷新（推荐）----
+      # 开启后容器常驻一个 HTTP 服务，插件转存成功后 POST /refresh 立即同步 strm + 刷新 Emby。
+      # 与上面的 CRON 可同时开启：webhook 负责实时，cron 负责兜底。
+      WEBHOOK_ENABLED: "true"
+      WEBHOOK_PORT: "5679"          # host 网络下直接监听宿主机此端口，别和 Alist 5678 冲突
+      WEBHOOK_TOKEN: "strmrefresh2026"  # 自定义一个强 token，插件调用时需带 X-Webhook-Token 头
+      WEBHOOK_DELAY: "0"            # 触发前延迟秒数；115 离线下载建议设 30-60 给下载/索引留时间
+
       # ---- 目录映射：加新目录就在这里加一条 ----
       # type 取 movie 或 tv；emby_path 必须是 Emby 媒体库已扫描的路径
       MAPPINGS: >-
