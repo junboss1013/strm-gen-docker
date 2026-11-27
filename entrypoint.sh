@@ -1,34 +1,48 @@
 #!/bin/sh
-# 容器入口（三种模式）：
-#   1) 默认：生成一次后退出（手动 docker compose run / 外部 cron）
-#   2) 设置 CRON：常驻，crond 定时执行
-#   3) 设置 WEBHOOK_ENABLED=true：常驻一个 webhook HTTP 服务，收到 POST /refresh 立即同步
-#      （可与 CRON 同时开启：webhook 实时 + cron 兜底）
+# 容器入口（可同时叠加三种模式）：
+#   1) CRON：常驻，按 CRON 定时同步 strm
+#   2) WEBHOOK_ENABLED=true：常驻 webhook HTTP 服务，收到 POST /refresh 立即同步
+#   3) EMBY_SCAN_ENABLED=true：常驻独立 cron，按 EMBY_SCAN_CRON 定时扫描指定 Emby 媒体库
+# 三种可并存：webhook 实时 + strm cron 兜底 + Emby 定向库扫描。
 set -e
 
 LOG=/out/run.log
 mkdir -p /out
 
-RUN_CMD="cd /app && /usr/local/bin/python /app/run_sync.py >> $LOG 2>&1"
+CRONTAB=/etc/crontabs/root
+: > "$CRONTAB"
 
+RUN_CMD="cd /app && /usr/local/bin/python /app/run_sync.py >> $LOG 2>&1"
+SCAN_CMD="cd /app && /usr/local/bin/python /app/emby_scan.py >> $LOG 2>&1"
+
+# ---- strm 同步 cron ----
 if [ -n "$CRON" ]; then
-    echo "[$CRON] $RUN_CMD" > /etc/crontabs/root
-    echo "[entrypoint] cron 模式：$CRON（日志 $LOG）"
+    echo "[$CRON] $RUN_CMD" >> "$CRONTAB"
+    echo "[entrypoint] strm 同步 cron：$CRON"
 fi
+
+# ---- Emby 定向媒体库扫描 cron（独立于 strm 同步）----
+EMBY_SCAN_ENABLED="${EMBY_SCAN_ENABLED:-false}"
+EMBY_SCAN_CRON="${EMBY_SCAN_CRON:-0 */3 * * *}"
+if [ "$EMBY_SCAN_ENABLED" = "true" ]; then
+    echo "[$EMBY_SCAN_CRON] $SCAN_CMD" >> "$CRONTAB"
+    echo "[entrypoint] Emby 定向扫描 cron：$EMBY_SCAN_CRON"
+fi
+
+HAS_CRON="no"
+[ -s "$CRONTAB" ] && HAS_CRON="yes"
 
 WEBHOOK_ENABLED="${WEBHOOK_ENABLED:-false}"
 
 if [ "$WEBHOOK_ENABLED" = "true" ]; then
     echo "[entrypoint] webhook 模式：监听端口 ${WEBHOOK_PORT:-5679}"
-    # 后台常驻 webhook 服务；有 CRON 时再启 crond；两者并存
     /usr/local/bin/python /app/webhook_server.py >> "$LOG" 2>&1 &
-    if [ -n "$CRON" ]; then
+    if [ "$HAS_CRON" = "yes" ]; then
         exec crond -f -l 2
     else
-        # 无 cron：仅 webhook 常驻，等待子进程
         wait
     fi
-elif [ -n "$CRON" ]; then
+elif [ "$HAS_CRON" = "yes" ]; then
     exec crond -f -l 2
 else
     echo "[entrypoint] 单次运行模式"

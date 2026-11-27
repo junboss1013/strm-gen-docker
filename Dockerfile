@@ -12,6 +12,7 @@ WORKDIR /app
 COPY gen_strm.py /app/gen_strm.py
 COPY run_sync.py /app/run_sync.py
 COPY webhook_server.py /app/webhook_server.py
+COPY emby_scan.py /app/emby_scan.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

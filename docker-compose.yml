@@ -6,7 +6,7 @@
 services:
   strm-gen:
     container_name: strm-gen
-    image: bossjun/strm-gen:latest
+    image: bossjun/strm-gen:1.0.3
     # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
@@ -37,7 +37,7 @@ services:
       # ---- 定时自动同步：5 段 cron（分 时 日 月 周）----
       # 设了 CRON 容器即常驻并按点执行；注释掉则只手动跑
       # 例："0 3 * * *" 每天 03:00；"*/30 * * * *" 每 30 分钟
-      CRON: "0 3 * * *"
+      CRON: "0 */2 * * *"
 
       # ---- Webhook 实时刷新（推荐）----
       # 开启后容器常驻一个 HTTP 服务，插件转存成功后 POST /refresh 立即同步 strm + 刷新 Emby。
@@ -45,7 +45,16 @@ services:
       WEBHOOK_ENABLED: "true"
       WEBHOOK_PORT: "5679"          # host 网络下直接监听宿主机此端口，别和 Alist 5678 冲突
       WEBHOOK_TOKEN: "strmrefresh2026"  # 自定义一个强 token，插件调用时需带 X-Webhook-Token 头
-      WEBHOOK_DELAY: "0"            # 触发前延迟秒数；115 离线下载建议设 30-60 给下载/索引留时间
+      WEBHOOK_DELAY: "30"           # 触发前延迟秒数；115 离线下载建议设 30-60 给下载/索引留时间
+
+      # ---- Emby 定向媒体库定时扫描（独立于 strm 同步 / webhook）----
+      # 每 3 小时扫描一次「电视剧/每日更新」和「电影/每日更新」两个媒体库（内网地址）
+      EMBY_SCAN_ENABLED: "true"
+      EMBY_SCAN_CRON: "0 */3 * * *"       # 每 3 小时整点扫描
+      EMBY_SCAN_BASE: "http://192.168.0.4:2345"
+      EMBY_SCAN_API_KEY: "a0000939efe14af6a40d024cf8f827fe"
+      EMBY_SCAN_LIBS: "电视剧/每日更新,电影/每日更新"
+      EMBY_SCAN_ITEM_IDS: "118860,118755"   # 兜底：电视剧/每日更新, 电影/每日更新
 
       # ---- 目录映射：加新目录就在这里加一条 ----
       # type 取 movie 或 tv；emby_path 必须是 Emby 媒体库已扫描的路径
