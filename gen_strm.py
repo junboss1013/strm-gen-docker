@@ -48,6 +48,9 @@ def load_config():
         "emby_api_key": _env("EMBY_API_KEY", ""),
         "emby_container": _env("EMBY_CONTAINER", "emby"),
         "auto_scan": _env("AUTO_SCAN", "true").lower() in ("1", "true", "yes", "on"),
+        # 增量合并模式：写入前不清空目标目录，只覆盖/新增 strm，保留目录里已有的其他文件。
+        # 用于把新 strm 写进已有大量历史 strm 的媒体库（如 /media/每日更新/*）而不破坏旧数据。
+        "merge_mode": _env("MERGE_MODE", "false").lower() in ("1", "true", "yes", "on"),
     }
     # 可选：挂载 config.json 覆盖上面的环境变量
     cfg_file = os.environ.get("CONFIG_FILE", "")
@@ -185,22 +188,52 @@ def process(cfg, mapping, root):
 def sync_to_emby(cfg, root):
     """tar 管道经 docker exec 解包进 Emby 容器根目录，写入 /media/...。
 
-    解包前先清理容器内由本工具管理的目标目录（MAPPINGS 的 emby_path），
-    避免历史遗留的「目录位置是文件」脏数据导致 tar 解包失败、整批 strm 同步不进去。
+    两种模式：
+    - 覆盖模式（默认）：解包前清理容器内由本工具管理的目标目录（MAPPINGS 的 emby_path），
+      避免历史遗留的「目录位置是文件」脏数据导致整批 strm 同步失败。适用于本工具独占的目录。
+    - 合并模式（MERGE_MODE=true）：不清空目标目录，直接 tar 解包覆盖/新增 strm，
+      保留目录里已有的其他文件。适用于写入已有大量历史 strm 的共享媒体库（如 /media/每日更新/*）。
+      仅对「本批次 strm 将要落地的确切路径」做脏数据检查：若某路径被误写成文件则单独删除。
     """
     container = cfg["emby_container"]
-    # 收集所有 emby_path 的顶层管理目录（如 /media/115/电影、/media/115/电视剧）
+    merge = cfg.get("merge_mode", False)
+
+    # 收集所有 emby_path 的顶层管理目录（如 /media/115/电影、/media/每日更新/电视剧）
     targets = set()
     for m in cfg.get("mappings", []):
         p = str(m.get("emby_path", "")).strip()
         if p.startswith("/"):
             targets.add("/" + p.strip("/"))
-    for p in sorted(targets):
-        # 先删干净（含被误写成文件的同名项），tar 会重建
-        subprocess.run(
-            ["docker", "exec", container, "rm", "-rf", p],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+
+    if not merge:
+        # 覆盖模式：先删干净（含被误写成文件的同名项），tar 会重建
+        for p in sorted(targets):
+            subprocess.run(
+                ["docker", "exec", container, "rm", "-rf", p],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    else:
+        # 合并模式：清空 OUT_ROOT 中本批次 strm 将要落到、但在容器里被误写成文件的路径。
+        # 只处理 OUT_ROOT 里真实出现的目录/文件，绝不触碰目标目录里其他历史 strm。
+        print("  [MERGE] 增量合并模式：保留目标目录已有文件，仅覆盖/新增本批 strm", flush=True)
+        for dirpath, dirnames, filenames in os.walk(root):
+            for d in dirnames:
+                rel_dir = os.path.relpath(os.path.join(dirpath, d), root)
+                # rel_dir 形如 media/115/电影/某剧；对应容器内 /media/...
+                container_path = "/" + rel_dir.replace(os.sep, "/")
+                # 若该位置在容器里是普通文件（非目录），删掉它以便 tar 建目录
+                chk = subprocess.run(
+                    ["docker", "exec", container, "sh", "-c",
+                     f'[ -f "{container_path}" ] && echo FILE || echo OK'],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                )
+                if (chk.stdout or "").strip() == "FILE":
+                    print(f"  [MERGE] 清理脏文件: {container_path}", flush=True)
+                    subprocess.run(
+                        ["docker", "exec", container, "rm", "-f", container_path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+
     tar = subprocess.Popen(
         ["tar", "-cf", "-", "-C", root, "."],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
