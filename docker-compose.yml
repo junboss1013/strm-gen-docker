@@ -6,7 +6,7 @@
 services:
   strm-gen:
     container_name: strm-gen
-    image: bossjun/strm-gen:1.0.4
+    image: bossjun/strm-gen:1.0.5
     # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
@@ -54,7 +54,7 @@ services:
       EMBY_SCAN_BASE: "http://192.168.0.4:2345"
       EMBY_SCAN_API_KEY: "a0000939efe14af6a40d024cf8f827fe"
       EMBY_SCAN_LIBS: "电视剧/每日更新,电影/每日更新"
-      EMBY_SCAN_ITEM_IDS: "118860,118755"   # 兜底：电视剧/每日更新, 电影/每日更新
+      EMBY_SCAN_PATHS: "/media/每日更新/电视剧,/media/每日更新/电影"   # 兜底根路径（库名解析不到时用）
 
       # ---- 增量合并：写入前不清空目标目录，保留已有历史 strm ----
       # 目标目录「每日更新」里已有大量历史 strm，必须开合并模式，否则会被清空
