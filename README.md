@@ -61,16 +61,24 @@ curl "http://<宿主机IP>:5679/health"
 - 教父转存插件/订阅插件转存成功后会自动 POST 这个地址（在插件配置里填 webhook 地址与 token）。
 - 115 **离线下载**是异步任务，文件真正到位可能要几分钟；可把 `WEBHOOK_DELAY` 设为 30~60 秒。
 
-## Emby 定时扫描 + 元数据补刮（v1.0.7）
+## Emby 定时扫描 + 元数据补刮（v1.0.8）
 
-`EMBY_SCAN_ENABLED=true` 时容器常驻一个独立 cron（默认每 3 小时），只处理 `EMBY_SCAN_LIBS` 指定的库，分两阶段：
+`EMBY_SCAN_ENABLED=true` 时容器常驻一个独立 cron（默认每 3 小时），只处理 `EMBY_SCAN_LIBS` 指定的库，分三阶段：
 
 | 阶段 | 做什么 | 耗时 |
 |---|---|---|
 | A 快速入库 | `Items/{folderId}/Refresh` + `ValidationOnly`，只校验文件、发现新增，**不请求任何外部元数据源** | 万级文件 < 1 秒 |
-| B 元数据补刮 | 回查库内**缺主海报**的 Series/Movie，逐个 `Items/{id}/Refresh` + `FullRefresh` 补海报/简介/TMDB ID | 每个几秒～几十秒 |
+| B 剧/电影补刮 | 回查库内**缺主海报**的 Series/Movie，逐个 `Items/{id}/Refresh` + `FullRefresh` 补海报/简介/TMDB ID | 每个几秒～几十秒 |
+| C 单集补刮 | 回查**缺 ProviderIds / 标题还是文件名 / 简介为空**的 Episode，按剧聚合后对命中的那几部剧做 `Recursive` 刷新，一次刷完整部剧 | 每部剧几秒～几分钟 |
 
-阶段 B 是**收敛式**的：补上之后就不再命中，不会每轮重刮全库。单条目连续失败 3 次会冷却 7 天，避免反复空打 TMDB。
+三个阶段都是**收敛式**的：补上之后就不再命中，不会每轮重刮全库。
+
+- 阶段 B 单条目连续失败 3 次冷却 7 天。
+- 阶段 C 按**缺集数从少到多**排队，小剧先清完，避免一部千集大剧长期霸占配额；同一部剧连续 3 轮没进展（对比上一轮缺集数不降）就冷却 7 天，防止永远匹配不上 TMDB 的剧反复空转。
+- 阶段 C 会跳过阶段 B 本轮刚触发过的剧，不重复排队。
+
+> **前提**：Emby 库里 `Episode` 类型的抓取器必须是开着的，否则 `Recursive` 刷新也不会去查 TMDB。
+> 检查方法：媒体库 → 高级 → 各类型选项 → 剧集，确认「元数据读取器」里有 `TheMovieDb`。
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
@@ -83,6 +91,13 @@ curl "http://<宿主机IP>:5679/health"
 | `EMBY_BACKFILL_LIMIT` | 每轮最多补刮多少个 | `30` |
 | `EMBY_BACKFILL_MAX_TRIES` / `_COOLDOWN` | 单条目重试上限 / 冷却秒数 | `3` / `7 天` |
 | `EMBY_BACKFILL_DELAY` | 扫完等几秒再补刮 | `10` |
+| `EMBY_EPISODE_ENABLED` | 是否开启阶段 C 单集补刮 | `true` |
+| `EMBY_EPISODE_LIMIT` | 每轮最多处理多少部剧 | `10` |
+| `EMBY_EPISODE_MAX_TRIES` / `_COOLDOWN` | 单部剧无进展上限 / 冷却秒数 | `3` / `7 天` |
+| `EMBY_EPISODE_DELAY` | 每部剧触发间隔秒数 | `5` |
+| `EMBY_EPISODE_MAX_PER_SERIES` | 单剧缺集超过此数就跳过（防千集大剧占住刷新队列） | `200` |
+
+首次补齐存量时可以临时把 `EMBY_EPISODE_LIMIT` 调大（例如 `60`），跑完再改回 10。
 
 ### 海报/简介还是不出来？先查「空壳 nfo」
 
