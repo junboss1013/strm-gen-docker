@@ -35,6 +35,15 @@ VIDEO_EXT = {
 PRUNE_ENABLED = os.environ.get("PRUNE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 PRUNE_MAX_PERCENT = float(os.environ.get("PRUNE_MAX_PERCENT", "50") or 50)
 PRUNE_DELETE_EMBY = os.environ.get("PRUNE_DELETE_EMBY", "1").strip().lower() not in ("0", "false", "no", "off")
+# 没有 manifest 时，是否扫磁盘按 URL 前缀认领历史 strm（升级后首次清理旧残留要靠它）
+PRUNE_INIT_SCAN = os.environ.get("PRUNE_INIT_SCAN", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# 【已废弃】新剧「定向扫描」队列（EMBY_NEW_SCAN_*）
+# 早期版本用 POST /Library/Refresh?Path=xxx 给新剧单独扫描，实测该接口会忽略 Path 参数、
+# 直接启动**全库扫描**（几小时），扫描期间还会因挂载抖动批量删除已有条目（真实事故）。
+# 现已确认 POST /Items/{libFolderId}/Refresh?MetadataRefreshMode=ValidationOnly
+# 本身就能为新目录建出 Series 与分集（5 万文件库约 60s 建壳、120s 出集），无需额外扫描。
+# 因此该机制整体移除；旧版本遗留的 .scan_pending.json 会被自动忽略。
 
 TOKEN = None
 ALIST = ""
@@ -437,8 +446,126 @@ def _docker_rm_tree(container, dir_path):
     )
 
 
+def _emby_all_series_map(base, h):
+    """拉库里所有 Series/Movie 的 Path -> {Id, Type} 映射。
+
+    不能用 GET /Items?Path=xxx 反查：实测该参数对「文件已不存在的条目」返回 0 条，
+    而我们要删的恰好都是这类条目。改为全量拉一遍本地比对，几千条几秒就完。
+    """
+    out = {}
+    for typ in ("Series", "Movie"):
+        start = 0
+        while True:
+            params = {"Recursive": "true", "IncludeItemTypes": typ,
+                      "Fields": "Path", "Limit": 1000, "StartIndex": start}
+            try:
+                r = requests.get(base + "/Items", headers=h, params=params, timeout=180)
+                d = r.json()
+            except Exception as e:
+                print(f"[PRUNE]   拉取 {typ} 列表失败: {e}", flush=True)
+                break
+            items = d.get("Items") or []
+            for it in items:
+                p = (it.get("Path") or "").rstrip("/")
+                if p:
+                    out[p] = {"Id": it.get("Id"), "Type": typ}
+            start += len(items)
+            if not items or start >= (d.get("TotalRecordCount") or 0):
+                break
+    return out
+
+
+def _emby_episode_list(base, h, series_id):
+    eps, start = [], 0
+    while True:
+        params = {"Fields": "Path", "Limit": 1000, "StartIndex": start}
+        try:
+            r = requests.get(base + f"/Shows/{series_id}/Episodes", headers=h, params=params, timeout=180)
+            d = r.json()
+        except Exception:
+            break
+        items = d.get("Items") or []
+        eps.extend(items)
+        start += len(items)
+        if not items or start >= (d.get("TotalRecordCount") or 0):
+            break
+    return eps
+
+
+def _emby_delete_ids(base, h, ids):
+    """删除条目。DeleteFiles=false 只是尽力而为——实测这个版本的 Emby 会连文件一起删，
+    所以调用方必须保证「该条目对应的文件确实已经不需要了」。"""
+    ok = 0
+    for i in ids:
+        try:
+            r = requests.delete(base + f"/Items/{i}", headers=h,
+                                params={"DeleteFiles": "false"}, timeout=60)
+            ok += 1 if r.status_code in (200, 204) else 0
+        except Exception:
+            pass
+    return ok
+
+
+def _is_season_dir(name):
+    """Season 2 / 第 2 季 / S02 这类季目录名。"""
+    return bool(name) and bool(re.match(r"(?i)^(?:season\s*\d{1,2}|第.{1,3}季|s\d{1,2})$", name))
+
+
+def _emby_remove_for_paths(cfg, removed_paths, empty_dirs):
+    """把「文件已被删掉」的条目从 Emby 里移除。
+
+    只删 Episode / Movie 级条目；Series 只有在其目录确认已空时才删
+    （删 Series 会级联删文件，目录还留东西时绝对不能碰）。
+    """
+    base = (cfg.get("emby_public") or "").rstrip("/")
+    key = cfg.get("emby_api_key") or ""
+    if not base or not key:
+        return 0, 0
+    h = {"X-Emby-Token": key}
+    smap = _emby_all_series_map(base, h)
+    if not smap:
+        return 0, 0
+
+    removed = set(removed_paths)
+    # 电影：Emby 里 Movie 条目的 Path 就是 strm 文件本身 → 直接精确命中。
+    # 剧集：条目的 Path 是剧目录，而我们要删的是 剧目录/Season N/xxx.strm，
+    #       必须把季目录上提一层才找得到 Series（否则「只删几集」永远删不掉条目）。
+    movie_ids, by_series = [], {}
+    for p in removed_paths:
+        hit = smap.get(p)
+        if hit and hit.get("Type") == "Movie":
+            movie_ids.append(hit["Id"])
+            continue
+        d = os.path.dirname(p)
+        if _is_season_dir(os.path.basename(d)):
+            d = os.path.dirname(d)
+        by_series.setdefault(d.rstrip("/"), []).append(p)
+
+    del_eps = _emby_delete_ids(base, h, movie_ids) if movie_ids else 0
+    for d, paths in by_series.items():
+        hit = smap.get(d)
+        if not hit or hit.get("Type") != "Series":
+            continue
+        eps = _emby_episode_list(base, h, hit["Id"])
+        # 只删「路径精确命中被删清单」的条目，避免误伤同剧其他集
+        drop = [e.get("Id") for e in eps if (e.get("Path") or "") in removed]
+        if drop:
+            del_eps += _emby_delete_ids(base, h, drop)
+
+    del_series = 0
+    for d in (empty_dirs or []):
+        hit = smap.get(d.rstrip("/"))
+        if not hit:
+            continue
+        # 二次确认：目录里真的没有 strm 了才删整条
+        if _docker_dir_has_strm(cfg["emby_container"], d) is not False:
+            continue
+        del_series += _emby_delete_ids(base, h, [hit["Id"]])
+    return del_eps, del_series
+
+
 def _emby_lookup(base, h, paths, workers=8):
-    """按 Path 反查 Emby 条目 ID。"""
+    """按 Path 反查 Emby 条目 ID（保留兼容，Path 查询对已删文件无效）。"""
     def one(p):
         try:
             r = requests.get(base + "/Items", headers=h,
@@ -469,6 +596,42 @@ def _emby_delete_items(base, h, ids, workers=4):
     return ok
 
 
+def managed_prefixes(cfg):
+    """本工具生成的 strm 内容一定以这些 URL 前缀开头。
+
+    用「URL 前缀」而不是 manifest 来认领文件，好处是首次运行 / manifest 丢失时
+    也能准确认出哪些是本工具写的，绝不会碰媒体库里其他工具生成的历史 strm。
+    """
+    base = (cfg.get("public_prefix") or "").rstrip("/") + "/d"
+    out = []
+    for m in cfg.get("mappings", []):
+        ap = str(m.get("alist_path", "")).rstrip("/")
+        if not ap:
+            continue
+        out.append(base + urllib.parse.quote(ap, safe="/") + "/")
+    return out
+
+
+def _grep_managed(container, target, prefixes):
+    """在目标目录里找出 URL 指向本工具源的 strm，返回容器内绝对路径列表。"""
+    if not prefixes:
+        return []
+    args = " ".join("-e '%s'" % p.replace("'", "'\\''") for p in prefixes)
+    script = (
+        f'find "{target}" -name "*.strm" -print0 2>/dev/null '
+        f'| xargs -0 grep -l -F {args} 2>/dev/null'
+    )
+    try:
+        r = subprocess.run(
+            ["docker", "exec", container, "sh", "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=900,
+        )
+    except Exception as e:
+        print(f"[PRUNE]   扫描历史 strm 失败: {e}", flush=True)
+        return []
+    return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+
+
 def prune_removed(cfg, current):
     """对账：上一轮有、本轮没有的 strm → 删除文件 + 删除 Emby 条目 + 清空目录。
 
@@ -483,12 +646,28 @@ def prune_removed(cfg, current):
     if not PRUNE_ENABLED:
         print("[PRUNE] 已关闭（PRUNE_ENABLED=0）", flush=True)
         return 0, {}
+    container = cfg["emby_container"]
     old = load_manifest()
     if not old:
-        print("[PRUNE] 首次运行，仅建立基线，不执行删除", flush=True)
-        return 0, {}
+        # 没有基线：扫一遍目标目录，按 strm 内容里的 URL 前缀认领本工具写过的文件。
+        # 这是「115 删了但媒体库没删」能一次性清干净的关键——只靠 manifest 的话，
+        # 升级前的历史 strm 永远不在基线里，就永远删不掉。
+        if not PRUNE_INIT_SCAN:
+            print("[PRUNE] 首次运行，仅建立基线，不执行删除", flush=True)
+            return 0, {}
+        prefixes = managed_prefixes(cfg)
+        for m in cfg.get("mappings", []):
+            tgt = "/" + str(m.get("emby_path", "")).strip("/")
+            if not tgt.strip("/"):
+                continue
+            found = _grep_managed(container, tgt, prefixes)
+            if found:
+                old[tgt] = found
+                print(f"[PRUNE] 首次对账：{tgt} 认出 {len(found)} 个历史 strm 属本工具", flush=True)
+        if not old:
+            print("[PRUNE] 首次运行，未发现历史 strm，仅建立基线", flush=True)
+            return 0, {}
 
-    container = cfg["emby_container"]
     total_del = 0
     skipped = {}
     for key, old_paths in old.items():
@@ -509,27 +688,27 @@ def prune_removed(cfg, current):
             continue
 
         print(f"[PRUNE] {key} 源已删除 {len(removed)} 个（{pct:.1f}%），开始清理", flush=True)
+
+        # 先删本地 /out 里的副本。本工具的同步方式是「把整个 /out tar 进 Emby」，
+        # 本地残留一个文件就等于下一轮又把它推回媒体库 —— 这正是过去「删了又长回来」的原因。
+        loc = 0
+        for p in removed:
+            lp = os.path.join(OUT_ROOT, p.lstrip("/"))
+            try:
+                if os.path.isfile(lp):
+                    os.remove(lp)
+                    loc += 1
+            except Exception:
+                pass
+        if loc:
+            print(f"[PRUNE]   删除本地 strm {loc}/{len(removed)}", flush=True)
+
         n = _docker_rm_files(container, removed)
         total_del += n
         print(f"[PRUNE]   删除 strm 文件 {n}/{len(removed)}", flush=True)
 
-        # 删除对应的 Emby 条目（ValidationOnly 扫描不会移除已消失文件的条目，必须显式删）
-        base = (cfg.get("emby_public") or "").rstrip("/")
-        h = {"X-Emby-Token": cfg.get("emby_api_key") or ""}
-        can_emby = bool(PRUNE_DELETE_EMBY and base and cfg.get("emby_api_key"))
-        if can_emby:
-            ids = _emby_lookup(base, h, removed)
-            if ids:
-                ok = _emby_delete_items(base, h, ids)
-                print(f"[PRUNE]   删除 Emby 条目 {ok}/{len(ids)}", flush=True)
-            else:
-                print("[PRUNE]   未在 Emby 找到对应条目（可能本就没入库）", flush=True)
-
         # 清理整部剧/整部电影目录：目录里已无 strm 就整目录删掉，避免留下空壳
         protected = {"/" + str(m.get("emby_path", "")).strip("/") for m in cfg.get("mappings", [])}
-
-        def _is_season_dir(name):
-            return bool(re.match(r"(?i)^(?:season\s*\d{1,2}|第.{1,3}季|s\d{1,2})$", name))
 
         # 先逐季检查（整季被删时 Season 会变空季，需要单独清）
         season_dirs = set()
@@ -541,10 +720,6 @@ def prune_removed(cfg, current):
             if _docker_dir_has_strm(container, d) is False:
                 print(f"[PRUNE]   清理空季 {d}", flush=True)
                 _docker_rm_tree(container, d)
-                if can_emby:
-                    ids = _emby_lookup(base, h, [d])
-                    if ids:
-                        _emby_delete_items(base, h, ids)
 
         tops = set()
         for p in removed:
@@ -553,17 +728,25 @@ def prune_removed(cfg, current):
             if _is_season_dir(os.path.basename(d)):
                 d = os.path.dirname(d)
             tops.add(d)
+        empty_tops = []
         for d in sorted(tops):
             if not d or d.count("/") < 2 or d in protected:
                 continue
             if _docker_dir_has_strm(container, d) is False:
                 print(f"[PRUNE]   清理空目录 {d}", flush=True)
                 _docker_rm_tree(container, d)
-                if can_emby:
-                    ids = _emby_lookup(base, h, [d])
-                    if ids:
-                        _emby_delete_items(base, h, ids)
-                        print(f"[PRUNE]   删除空壳条目 {len(ids)} 个", flush=True)
+                empty_tops.append(d)
+
+        # 删 Emby 条目（ValidationOnly 扫描不会移除已消失文件的条目，必须显式删）
+        if PRUNE_DELETE_EMBY:
+            try:
+                de, ds = _emby_remove_for_paths(cfg, removed, empty_tops)
+                if de or ds:
+                    print(f"[PRUNE]   删除 Emby 条目：分集/电影 {de} 个，空剧/空片 {ds} 个", flush=True)
+                else:
+                    print("[PRUNE]   Emby 里没有需要删除的条目", flush=True)
+            except Exception as e:
+                print(f"[PRUNE]   删除 Emby 条目失败（忽略）: {e}", flush=True)
     return total_del, skipped
 
 
@@ -695,7 +878,9 @@ def trigger_scan(cfg):
     except Exception as e:
         print(f"[SCAN] 自愈检查失败（忽略）: {e}", flush=True)
 
-    # 快速入库：对每个目标媒体目录做 ValidationOnly 刷新
+    # 快速入库：对每个目标媒体目录做 ValidationOnly 刷新。
+    # 实测这一种就够了——它能发现新增目录并建出 Series/分集；不要再用 Library/Refresh?Path=
+    # 给新剧「单独扫描」，那个接口会忽略 Path 启动全库扫描，是历史事故的根源。
     done = 0
     for m in cfg.get("mappings", []):
         p = str(m.get("emby_path", "")).strip()
@@ -703,15 +888,16 @@ def trigger_scan(cfg):
             continue
         path = "/" + p.strip("/")
         fid = _folder_id(path)
+        if not fid:
+            # 解析不到库 folder 就跳过。绝不用 /Library/Refresh?Path= 兜底：
+            # 该接口会忽略 Path 直接启动全库扫描，几小时跑不完，还会批量删条目。
+            print(f"[SCAN] {path} 找不到对应库 folder，跳过（不影响入库）", flush=True)
+            continue
         try:
-            if fid:
-                url = (base + f"/Items/{fid}/Refresh?Recursive=true"
-                       "&MetadataRefreshMode=ValidationOnly&ImageRefreshMode=ValidationOnly"
-                       "&ReplaceAllMetadata=false&ReplaceAllImages=false")
-                r = requests.post(url, headers=h, timeout=300)
-            else:
-                r = requests.post(base + "/Library/Refresh", headers=h,
-                                  params={"Path": path, "Recursive": "true"}, timeout=300)
+            url = (base + f"/Items/{fid}/Refresh?Recursive=true"
+                   "&MetadataRefreshMode=ValidationOnly&ImageRefreshMode=ValidationOnly"
+                   "&ReplaceAllMetadata=false&ReplaceAllImages=false")
+            r = requests.post(url, headers=h, timeout=300)
             print(f"[SCAN] {path} (folder_id={fid}) -> HTTP {r.status_code}", flush=True)
             if r.status_code in (200, 204):
                 done += 1
@@ -720,22 +906,87 @@ def trigger_scan(cfg):
     return done > 0
 
 
+def _clean_local_orphans(current):
+    """删掉 OUT_ROOT 里不属于本轮有效集合的 strm。
+
+    同步是「把整个 OUT_ROOT tar 进 Emby」，本地多一个文件 = 媒体库多一个文件。
+    所以必须保证 OUT_ROOT 内容与本轮有效集合一致，否则失效文件会被反复推回 Emby。
+    """
+    keep = set()
+    for paths in (current or {}).values():
+        for p in (paths or []):
+            keep.add(p)
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(OUT_ROOT):
+        rel_dir = os.path.relpath(dirpath, OUT_ROOT)
+        if rel_dir != "." and rel_dir.split(os.sep)[0].startswith("."):
+            dirnames[:] = []
+            continue
+        for f in filenames:
+            if not f.lower().endswith(".strm"):
+                continue
+            fp = os.path.join(dirpath, f)
+            relp = os.path.relpath(fp, OUT_ROOT).replace(os.sep, "/")
+            if "/" + relp not in keep:
+                try:
+                    os.remove(fp)
+                    removed += 1
+                except Exception:
+                    pass
+    if removed:
+        print(f"[CLEAN] 清理本地孤儿 strm {removed} 个", flush=True)
+    for dirpath, dirnames, filenames in os.walk(OUT_ROOT, topdown=False):
+        if os.path.abspath(dirpath) == os.path.abspath(OUT_ROOT):
+            continue
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+        except Exception:
+            pass
+
+
+def _verify_sync(cfg, current):
+    """tar 之后抽查几个文件是否真的落到容器里。
+
+    tar 返回 0 不代表写对了位置（比如目标被误建成同名普通文件）。
+    逐个校验上万个文件太慢，抽样足以发现「整批没进去」这类故障。
+    """
+    container = cfg["emby_container"]
+    samples = []
+    for paths in (current or {}).values():
+        ps = list(paths or [])
+        if ps:
+            samples.extend([ps[0], ps[-1]])
+    samples = list(dict.fromkeys(samples))[:6]
+    if not samples:
+        return
+    cmd = " ; ".join('[ -f "%s" ] && echo OK || echo MISS' % s.replace('"', '\\"')
+                     for s in samples)
+    try:
+        r = subprocess.run(["docker", "exec", container, "sh", "-c", cmd],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, timeout=120)
+        miss = (r.stdout or "").count("MISS")
+    except Exception as e:
+        print(f"[SYNC] 抽查失败（忽略）: {e}", flush=True)
+        return
+    if miss:
+        print(f"[SYNC] 校验未通过：抽查 {len(samples)} 个文件，{miss} 个不在容器内", flush=True)
+    else:
+        print(f"[SYNC] 抽查 {len(samples)} 个文件均已就位", flush=True)
+
+
 def main():
     cfg = load_config()
     login(cfg)
-    # OUT_ROOT 通常是挂载卷，不能直接删除目录本身（Resource busy），只清空其内容。
-    # 注意保留隐藏状态文件（.strm_manifest.json / .emby_scan_state.json）：它们是持久状态，
-    # 清掉会导致对账基线丢失、扫描自愈与补刮冷却失效。
+    # 注意：不再清空 OUT_ROOT。
+    # 以前每轮 rmtree 重建，导致所有 strm 的 mtime 全部刷新，Emby 会把每一个文件都当成
+    # 新文件重新探测远程直链（单集 1~10 秒），扫描长期跑不完；更关键的是「源已删除」的
+    # 文件先被删掉、又被 tar 原样推回媒体库，删除同步等于没做。
+    # 现在改为「增量覆盖 + 显式对账」：内容相同的文件不动（mtime 保持），
+    # 失效文件由 prune_removed() 同时从 OUT_ROOT 和 Emby 两侧删除。
     os.makedirs(OUT_ROOT, exist_ok=True)
-    for entry in os.listdir(OUT_ROOT):
-        if entry.startswith("."):
-            continue
-        p = os.path.join(OUT_ROOT, entry)
-        if os.path.isdir(p) and not os.path.islink(p):
-            import shutil
-            shutil.rmtree(p)
-        else:
-            os.remove(p)
+
     total = 0
     current = {}
     for m in cfg["mappings"]:
@@ -744,10 +995,8 @@ def main():
         current["/" + str(m["emby_path"]).strip("/")] = paths
         print(f"[OK] {m['alist_path']} -> {m['emby_path']} : {n} strm", flush=True)
 
-    if sync_to_emby(cfg, OUT_ROOT):
-        print(f"[SYNC] {total} strm -> {cfg['emby_container']}:/", flush=True)
-
-    # 源文件已删除 → 清理 strm 与 Emby 条目
+    # 源文件已删除 → 先清本地 strm，再清容器文件/空目录，最后删 Emby 条目。
+    # 必须排在 sync 之前：本地不清干净，tar 会把刚删掉的文件又推回媒体库。
     try:
         d, skipped = prune_removed(cfg, current)
         if d:
@@ -758,6 +1007,13 @@ def main():
             current[k] = merged
     except Exception as e:
         print(f"[PRUNE] 清理失败（不影响入库）: {e}", flush=True)
+
+    # 兜底：OUT_ROOT 里既不在本轮结果、也不在 manifest 的孤儿 strm（manifest 丢失、手工拷贝）
+    _clean_local_orphans(current)
+
+    if sync_to_emby(cfg, OUT_ROOT):
+        print(f"[SYNC] {total} strm -> {cfg['emby_container']}:/", flush=True)
+        _verify_sync(cfg, current)
 
     save_manifest(current)
 
