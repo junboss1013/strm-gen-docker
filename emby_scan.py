@@ -58,7 +58,7 @@ Emby 媒体库入库扫描（快速模式）+ 缺元数据自动补刮（剧/电
   EMBY_EPISODE_COOLDOWN    冷却秒数，默认 7 天
   EMBY_EPISODE_DELAY       每部剧触发间隔秒数，默认 5
   EMBY_EPISODE_SETTLE      多久之后结算「上一轮是否有效」，默认 1800 秒
-  EMBY_EPISODE_MAX_PER_SERIES  单剧缺集超过此数就跳过，默认 200
+  EMBY_EPISODE_MAX_PER_SERIES  单剧缺集超过此数就跳过，默认 500
 """
 import json
 import os
@@ -87,7 +87,7 @@ EPISODE_DELAY = int(os.environ.get("EMBY_EPISODE_DELAY", "5") or 5)
 EPISODE_SETTLE = int(os.environ.get("EMBY_EPISODE_SETTLE", "1800") or 1800)
 # 单部剧缺集太多时跳过：一次 Recursive 刷新会长时间霸占 Emby 的刷新队列，
 # 把后面的新文件入库一起卡住。正常剧集不会超过这个数。
-EPISODE_MAX_PER_SERIES = int(os.environ.get("EMBY_EPISODE_MAX_PER_SERIES", "200") or 200)
+EPISODE_MAX_PER_SERIES = int(os.environ.get("EMBY_EPISODE_MAX_PER_SERIES", "500") or 500)
 
 HEADERS = {"X-Emby-Token": KEY} if KEY else {}
 SCAN_TASK_KEY = "RefreshLibrary"
@@ -334,13 +334,18 @@ def backfill_missing(session, targets):
 
 
 def episode_missing_meta(ep):
-    """判断单集是否缺元数据：没外部 ID / 标题还是文件名 / 简介为空。"""
+    """单集是否真的缺元数据。
+
+    判据只有两个：
+      1) 完全没有 ProviderIds —— 说明这集从没刮过（新入库的都是这种）；
+      2) 有 ID 但标题还是文件名（带网盘广告）—— 说明上次刮削没写进标题。
+    注意：有 ID 但 Overview 为空**不算缺**。那是 TMDB 上这一集本身就没有简介，
+    再刷一百遍也还是空，把它算进候选只会白占补刮配额、把真正没刮过的集挤掉。
+    """
     if not (ep.get("ProviderIds") or {}):
         return True
     nm = ep.get("Name") or ""
-    if any(m in nm for m in AD_MARKERS):
-        return True
-    return not (ep.get("Overview") or "").strip()
+    return any(m in nm for m in AD_MARKERS)
 
 
 def episode_backfill(session, targets, skip_series=None):
@@ -373,7 +378,7 @@ def episode_backfill(session, targets, skip_series=None):
 
     miss_total = sum(v["miss"] for v in stat.values())
     print(
-        f"[emby-scan] 单集检查：{total_ep} 集，{miss_total} 集缺元数据，涉及 {len(stat)} 部剧",
+        f"[emby-scan] 单集检查：{total_ep} 集，{miss_total} 集从未刮到元数据，涉及 {len(stat)} 部剧",
         flush=True,
     )
     if not stat:

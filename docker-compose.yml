@@ -6,7 +6,7 @@
 services:
   strm-gen:
     container_name: strm-gen
-    image: bossjun/strm-gen:1.0.8
+    image: bossjun/strm-gen:1.0.9
     # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
@@ -64,7 +64,7 @@ services:
       EMBY_EPISODE_LIMIT: "20"            # 每轮最多处理多少部剧（缺集数少的优先，小剧先清完）
       EMBY_EPISODE_MAX_TRIES: "3"         # 同一部剧连续几轮没进展就冷却
       EMBY_EPISODE_DELAY: "5"             # 每部剧触发间隔秒数，别把 Emby 刷新队列挤爆
-      EMBY_EPISODE_MAX_PER_SERIES: "200"  # 单剧缺集超过这个数就跳过（避免千集大剧占住刷新队列）
+      EMBY_EPISODE_MAX_PER_SERIES: "500"  # 单剧缺集超过这个数就跳过（避免千集大剧占住刷新队列）
 
       # ---- 增量合并：写入前不清空目标目录，保留已有历史 strm ----
       # 目标目录「每日更新」里已有大量历史 strm，必须开合并模式，否则会被清空
