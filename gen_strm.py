@@ -16,11 +16,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 
 import requests
 
 OUT_ROOT = os.environ.get("OUT_ROOT", "/out")
+SCAN_STATE_FILE = "/out/.emby_scan_state.json"
 VIDEO_EXT = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
     ".ts", ".m2ts", ".iso", ".rmvb", ".vob", ".mpg", ".mpeg",
@@ -179,8 +181,21 @@ def process(cfg, mapping, root):
             os.makedirs(ed, exist_ok=True)
             ep_title = clean(os.path.splitext(name)[0])
             sp = os.path.join(ed, f"{series} - S{season:02d}E{ep:02d} - {ep_title}.strm")
+        url = direct_url(public_prefix, full)
+        # 【关键优化】内容未变时不重写文件，保住原 mtime。
+        # Emby 扫描是按 (mtime, size) 判断文件是否变化；之前每次同步都覆盖全部 strm，
+        # mtime 全被刷新，导致 Emby 每次都把上万个 strm 当成新文件重新探测远程直链
+        # （单个 1~10 秒），扫描要数小时且极易卡死。保持 mtime 后 Emby 只处理真正新增的文件。
+        if os.path.exists(sp):
+            try:
+                with open(sp, encoding="utf-8") as f:
+                    if f.read() == url:
+                        cnt += 1
+                        continue
+            except Exception:
+                pass
         with open(sp, "w", encoding="utf-8") as f:
-            f.write(direct_url(public_prefix, full))
+            f.write(url)
         cnt += 1
     return cnt
 
@@ -249,15 +264,93 @@ def sync_to_emby(cfg, root):
     return True
 
 
+def _load_scan_state():
+    try:
+        with open(SCAN_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_scan_state(d):
+    try:
+        os.makedirs(os.path.dirname(SCAN_STATE_FILE) or ".", exist_ok=True)
+        with open(SCAN_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def trigger_scan(cfg):
+    """触发 Emby 入库扫描（快速模式），带卡死自愈。
+
+    【为什么不用 /Library/Refresh】
+    实测 /Library/Refresh 会启动全库扫描并对每个已有 strm 完整重新刮削
+    （每集向 TMDB 请求 5 种语言），1.2 万文件要十几小时；期间任务一直 Running，
+    后续扫描请求全被吞掉；遇到损坏 .nfo 还会让扫描线程挂掉、状态永久卡死。
+
+    【正确做法】
+    对每个写库目标目录反查 Emby 的 Folder 条目，然后：
+      POST /Items/{folderId}/Refresh?Recursive=true
+           &MetadataRefreshMode=ValidationOnly&ImageRefreshMode=ValidationOnly
+    只校验文件、发现新增，不请求外部元数据源 —— 实测 15 秒完成，新文件立即入库。
+    元数据可在 Emby 里对该剧单独「识别/刷新」补全。
+    """
     if not cfg["emby_public"] or not cfg["emby_api_key"]:
         return False
-    requests.post(
-        cfg["emby_public"].rstrip("/") + "/Library/Refresh",
-        headers={"X-Emby-Token": cfg["emby_api_key"]},
-        timeout=30,
-    )
-    return True
+    base = cfg["emby_public"].rstrip("/")
+    h = {"X-Emby-Token": cfg["emby_api_key"]}
+
+    def _folder_id(path):
+        try:
+            r = requests.get(base + "/Items", headers=h,
+                             params={"Path": path, "Recursive": "false", "Fields": "Path"}, timeout=60)
+            items = r.json().get("Items") or []
+            return items[0].get("Id") if items else None
+        except Exception:
+            return None
+
+    # 自愈：清理历史残留的卡死全库任务
+    try:
+        tasks = requests.get(base + "/ScheduledTasks", headers=h, timeout=20).json()
+        task = next((t for t in tasks if t.get("Key") == "RefreshLibrary"), None)
+        if task and task.get("State") == "Running":
+            prog = task.get("CurrentProgressPercentage")
+            prev = _load_scan_state()
+            same = (prog is not None and prev.get("progress") is not None
+                    and abs(float(prog) - float(prev["progress"])) < 0.01)
+            if same:
+                print(f"[SCAN] 全库扫描卡死（进度停在 {prog}），先停止复位", flush=True)
+                requests.delete(base + f"/ScheduledTasks/Running/{task.get('Id')}", headers=h, timeout=20)
+                time.sleep(3)
+            else:
+                print(f"[SCAN] 全库扫描进行中（{prog}%），不影响本次快速入库", flush=True)
+    except Exception as e:
+        print(f"[SCAN] 自愈检查失败（忽略）: {e}", flush=True)
+
+    # 快速入库：对每个目标媒体目录做 ValidationOnly 刷新
+    done = 0
+    for m in cfg.get("mappings", []):
+        p = str(m.get("emby_path", "")).strip()
+        if not p.startswith("/"):
+            continue
+        path = "/" + p.strip("/")
+        fid = _folder_id(path)
+        try:
+            if fid:
+                url = (base + f"/Items/{fid}/Refresh?Recursive=true"
+                       "&MetadataRefreshMode=ValidationOnly&ImageRefreshMode=ValidationOnly"
+                       "&ReplaceAllMetadata=false&ReplaceAllImages=false")
+                r = requests.post(url, headers=h, timeout=300)
+            else:
+                r = requests.post(base + "/Library/Refresh", headers=h,
+                                  params={"Path": path, "Recursive": "true"}, timeout=300)
+            print(f"[SCAN] {path} (folder_id={fid}) -> HTTP {r.status_code}", flush=True)
+            if r.status_code in (200, 204):
+                done += 1
+        except Exception as e:
+            print(f"[SCAN] {path} 触发失败: {e}", flush=True)
+    return done > 0
 
 
 def main():
