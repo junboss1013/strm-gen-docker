@@ -268,14 +268,19 @@ def _tidy_ep_title(title, series, season=None, ep=None):
         return ""
     if t == series:
         return ""
-    # 标题里常重复剧名
-    if series and t.startswith(series):
-        t = t[len(series):].strip(" -_.·")
+    # 标题里常重复剧名。文件名里的剧名通常不带年份，而 series 带「(2026)」，
+    # 直接 startswith 会匹配不上（例如「青春共体 - S01E01」对「青春共体 (2026)」），
+    # 于是整段被当成标题，拼出「剧名 (2026) - S01E01 - 剧名 - S01E01」的冗余名。
+    base_series = re.sub(r"\s*[(\[]\s*(?:19|20)\d{2}\s*[)\]]\s*$", "", series or "").strip()
+    for cand in (series, base_series):
+        if cand and t.startswith(cand):
+            t = t[len(cand):].strip(" -_.·")
+            break
     # 「Season 2 - 178」「S02E178」这类已由文件名本身表达
     if season is not None and ep is not None:
         for pat in (
             r"(?i)^season\s*\d{1,2}\s*[-–—_.:]?\s*%d\b" % ep,
-            r"(?i)^s\d{1,2}\s*[.\-_ ]?e?p?\s*%d\b" % ep,
+            r"(?i)^s\d{1,2}\s*[.\-_ ]?e?p?\s*0*%d\b" % ep,
             r"^第\s*%d\s*[集话回]" % ep,
         ):
             t2 = re.sub(pat, "", t).strip(" -_.·")
