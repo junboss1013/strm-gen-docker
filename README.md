@@ -61,6 +61,58 @@ curl "http://<宿主机IP>:5679/health"
 - 教父转存插件/订阅插件转存成功后会自动 POST 这个地址（在插件配置里填 webhook 地址与 token）。
 - 115 **离线下载**是异步任务，文件真正到位可能要几分钟；可把 `WEBHOOK_DELAY` 设为 30~60 秒。
 
+## Emby 定时扫描 + 元数据补刮（v1.0.7）
+
+`EMBY_SCAN_ENABLED=true` 时容器常驻一个独立 cron（默认每 3 小时），只处理 `EMBY_SCAN_LIBS` 指定的库，分两阶段：
+
+| 阶段 | 做什么 | 耗时 |
+|---|---|---|
+| A 快速入库 | `Items/{folderId}/Refresh` + `ValidationOnly`，只校验文件、发现新增，**不请求任何外部元数据源** | 万级文件 < 1 秒 |
+| B 元数据补刮 | 回查库内**缺主海报**的 Series/Movie，逐个 `Items/{id}/Refresh` + `FullRefresh` 补海报/简介/TMDB ID | 每个几秒～几十秒 |
+
+阶段 B 是**收敛式**的：补上之后就不再命中，不会每轮重刮全库。单条目连续失败 3 次会冷却 7 天，避免反复空打 TMDB。
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `EMBY_SCAN_ENABLED` / `EMBY_SCAN_CRON` | 是否开启定时扫描 / cron 表达式 | `false` / `0 */3 * * *` |
+| `EMBY_SCAN_BASE` / `EMBY_SCAN_API_KEY` | Emby 内网地址 / API Key | 必填 |
+| `EMBY_SCAN_LIBS` | 要管的库名（逗号分隔），会解析出所有挂载路径 | 必填 |
+| `EMBY_SCAN_PATHS` | 库名解析失败时的兜底根路径 | 空 |
+| `EMBY_SCAN_MODE` | `validation`（推荐）/ `refresh`（旧全库刷新，极慢） | `validation` |
+| `EMBY_BACKFILL_ENABLED` | 是否开启阶段 B 补刮 | `true` |
+| `EMBY_BACKFILL_LIMIT` | 每轮最多补刮多少个 | `30` |
+| `EMBY_BACKFILL_MAX_TRIES` / `_COOLDOWN` | 单条目重试上限 / 冷却秒数 | `3` / `7 天` |
+| `EMBY_BACKFILL_DELAY` | 扫完等几秒再补刮 | `10` |
+
+### 海报/简介还是不出来？先查「空壳 nfo」
+
+Emby 的 `SaveLocalMetadata` 若曾开启，会把刮削结果写回媒体目录的 `tvshow.nfo` / `movie.nfo`。
+如果那次扫描没刮到东西，就会写出一个**只有标题、没有 tmdbid/year 的空壳 nfo**。
+之后再怎么刷新，Emby 都认为「本地已有元数据」，不再向 TMDB 搜索 —— 表现就是**有壳无皮、永远没海报**。
+
+排查与清理（在 Emby 容器内执行）：
+
+```bash
+docker exec -it emby sh -c 'cd "/media/每日更新" && find . -name "*.nfo" -exec grep -LiE "tmdbid|imdbid|tvdbid" {} +'
+```
+
+列出来的就是空壳 nfo，备份后删除，再触发一次库扫描即可：
+
+```bash
+# 备份（示例：打包到 Emby 配置目录）
+docker exec emby sh -c 'cd "/media/每日更新" && find . -name "*.nfo" -exec grep -LiE "tmdbid|imdbid|tvdbid" {} + > /tmp/e.txt && tar czf /config/nfo_backup.tgz -T /tmp/e.txt'
+# 删除
+docker exec emby sh -c 'cd "/media/每日更新" && find . -name "*.nfo" -exec grep -LiE "tmdbid|imdbid|tvdbid" {} + | while read f; do rm -f "$f"; done'
+```
+
+同时把媒体库的 `SaveLocalMetadata` 关掉，避免再次生成空壳：媒体库设置 → 元数据 → 取消「将元数据保存到媒体文件夹中」。
+
+> 个别剧（目录名是纯外文/无年份，如 `再婚皇后 재혼황후`）TMDB 匹配不上时，可在该剧目录手写一个带 ID 的 `tvshow.nfo`：
+> ```xml
+> <tvshow><title>再婚皇后</title><year>2026</year><tmdbid>279246</tmdbid></tvshow>
+> ```
+> 再对该条目触发一次元数据刷新即可。
+
 ### MAPPINGS 格式
 
 ```json

@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("WEBHOOK_PORT", "5679"))
 TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 DELAY = int(os.environ.get("WEBHOOK_DELAY", "0"))  # 触发前延迟秒数，给离线下载/网盘索引留时间
-VERSION = "1.0.6"  # 镜像版本标记，便于 /health 核验部署版本
+VERSION = "1.0.7"  # 镜像版本标记，便于 /health 核验部署版本
 RUN_CMD = [sys.executable, "/app/run_sync.py"]
 
 

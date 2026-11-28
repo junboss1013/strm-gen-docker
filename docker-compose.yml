@@ -6,7 +6,7 @@
 services:
   strm-gen:
     container_name: strm-gen
-    image: bossjun/strm-gen:1.0.6
+    image: bossjun/strm-gen:1.0.7
     # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
@@ -56,6 +56,10 @@ services:
       EMBY_SCAN_LIBS: "电视剧/每日更新,电影/每日更新"
       EMBY_SCAN_PATHS: "/media/每日更新/电视剧,/media/每日更新/电影"   # 兜底根路径（库名解析不到时用）
       EMBY_SCAN_MODE: "validation"        # validation=只校验文件秒级入库（推荐）；refresh=旧全库刮削（极慢）
+      EMBY_BACKFILL_ENABLED: "true"       # 扫描后给缺海报的新条目自动补刮元数据（本版新增）
+      EMBY_BACKFILL_LIMIT: "30"           # 每轮最多补刮多少个条目
+      EMBY_BACKFILL_MAX_TRIES: "3"        # 单条目最多重试次数，超过后冷却 7 天
+      EMBY_BACKFILL_DELAY: "10"           # 扫描完成后等待几秒再补刮，给库扫描留出建条目时间
 
       # ---- 增量合并：写入前不清空目标目录，保留已有历史 strm ----
       # 目标目录「每日更新」里已有大量历史 strm，必须开合并模式，否则会被清空
