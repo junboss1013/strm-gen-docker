@@ -6,7 +6,7 @@
 services:
   strm-gen:
     container_name: strm-gen
-    image: bossjun/strm-gen:1.1.5
+    image: bossjun/strm-gen:1.1.6
     # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
@@ -76,6 +76,7 @@ services:
       # 安全阀：首次运行只建基线不删；单轮删除比例超阈值就跳过，避免挂载抖动误删整库。
       PRUNE_ENABLED: "true"
       PRUNE_MAX_PERCENT: "50"        # 单轮最多删全库的百分之多少，超了就跳过（大清理时临时调大）
+      PRUNE_GUARD_MIN: "5"           # 删除数小于该值时不受比例限制（否则 1 集的剧永远删不掉）
       PRUNE_DELETE_EMBY: "true"      # 同时删除 Emby 条目（只删 strm 的话 Emby 会留空壳）
       PRUNE_INIT_SCAN: "true"        # 没有清单时扫磁盘、按 URL 前缀认领历史 strm（升级后首次清理靠它）
       # 注：EMBY_NEW_SCAN_* 已移除。它用 Library/Refresh?Path= 给新剧单独扫描，

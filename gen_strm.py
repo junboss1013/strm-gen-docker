@@ -34,6 +34,9 @@ VIDEO_EXT = {
 # ---- 删除同步（源文件消失 → 删 strm + 删 Emby 条目）----
 PRUNE_ENABLED = os.environ.get("PRUNE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 PRUNE_MAX_PERCENT = float(os.environ.get("PRUNE_MAX_PERCENT", "50") or 50)
+# 比例保护只对「大批量」生效：1~4 个文件的删除直接放行，
+# 否则只有 1 集的剧、单片电影会因为 100% > 阈值而永远删不掉。
+PRUNE_GUARD_MIN = int(os.environ.get("PRUNE_GUARD_MIN", "5") or 5)
 PRUNE_DELETE_EMBY = os.environ.get("PRUNE_DELETE_EMBY", "1").strip().lower() not in ("0", "false", "no", "off")
 # 没有 manifest 时，是否扫磁盘按 URL 前缀认领历史 strm（升级后首次清理旧残留要靠它）
 PRUNE_INIT_SCAN = os.environ.get("PRUNE_INIT_SCAN", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -390,6 +393,30 @@ def save_manifest(paths):
         print(f"  [WARN] 写 manifest 失败: {e}", flush=True)
 
 
+def _local_orphans(key, cur, old_paths):
+    """OUT_ROOT 里属于该映射、但既不在本轮结果、也不在上一轮清单里的 strm。
+
+    来源：manifest 丢失后的残留、手工拷进来的副本。它们留在本地就会被 tar
+    推回媒体库，表现成「115 删了、媒体库删了、下一轮又自己长回来」。
+    交给 prune_removed 统一处理，才能保证本地/容器/Emby 条目三层一起删。
+    """
+    root = os.path.join(OUT_ROOT, key.lstrip("/"))
+    if not os.path.isdir(root):
+        return []
+    known = set(cur) | set(old_paths or [])
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for f in filenames:
+            if not f.lower().endswith(".strm"):
+                continue
+            fp = os.path.join(dirpath, f)
+            rel = os.path.relpath(fp, OUT_ROOT).replace(os.sep, "/")
+            cp = "/" + rel
+            if cp not in known:
+                out.append(cp)
+    return out
+
+
 def _docker_rm_files(container, paths, batch=200):
     """在 Emby 容器里批量删除文件（NUL 分隔，兼容空格与中文）。"""
     if not paths:
@@ -677,10 +704,13 @@ def prune_removed(cfg, current):
             skipped[key] = list(old_paths or [])
             continue
         removed = [p for p in (old_paths or []) if p not in cur]
+        for p in _local_orphans(key, cur, old_paths):
+            if p not in removed:
+                removed.append(p)
         if not removed:
             continue
         pct = 100.0 * len(removed) / max(len(old_paths or []), 1)
-        if pct > PRUNE_MAX_PERCENT:
+        if len(removed) >= PRUNE_GUARD_MIN and pct > PRUNE_MAX_PERCENT:
             print(f"[PRUNE] {key} 待删 {len(removed)}/{len(old_paths)}（{pct:.0f}%）"
                   f" 超过阈值 {PRUNE_MAX_PERCENT:.0f}%，本轮跳过。"
                   f"确认无误可调大 PRUNE_MAX_PERCENT 或置 100", flush=True)
@@ -906,45 +936,6 @@ def trigger_scan(cfg):
     return done > 0
 
 
-def _clean_local_orphans(current):
-    """删掉 OUT_ROOT 里不属于本轮有效集合的 strm。
-
-    同步是「把整个 OUT_ROOT tar 进 Emby」，本地多一个文件 = 媒体库多一个文件。
-    所以必须保证 OUT_ROOT 内容与本轮有效集合一致，否则失效文件会被反复推回 Emby。
-    """
-    keep = set()
-    for paths in (current or {}).values():
-        for p in (paths or []):
-            keep.add(p)
-    removed = 0
-    for dirpath, dirnames, filenames in os.walk(OUT_ROOT):
-        rel_dir = os.path.relpath(dirpath, OUT_ROOT)
-        if rel_dir != "." and rel_dir.split(os.sep)[0].startswith("."):
-            dirnames[:] = []
-            continue
-        for f in filenames:
-            if not f.lower().endswith(".strm"):
-                continue
-            fp = os.path.join(dirpath, f)
-            relp = os.path.relpath(fp, OUT_ROOT).replace(os.sep, "/")
-            if "/" + relp not in keep:
-                try:
-                    os.remove(fp)
-                    removed += 1
-                except Exception:
-                    pass
-    if removed:
-        print(f"[CLEAN] 清理本地孤儿 strm {removed} 个", flush=True)
-    for dirpath, dirnames, filenames in os.walk(OUT_ROOT, topdown=False):
-        if os.path.abspath(dirpath) == os.path.abspath(OUT_ROOT):
-            continue
-        try:
-            if not os.listdir(dirpath):
-                os.rmdir(dirpath)
-        except Exception:
-            pass
-
-
 def _verify_sync(cfg, current):
     """tar 之后抽查几个文件是否真的落到容器里。
 
@@ -1007,9 +998,6 @@ def main():
             current[k] = merged
     except Exception as e:
         print(f"[PRUNE] 清理失败（不影响入库）: {e}", flush=True)
-
-    # 兜底：OUT_ROOT 里既不在本轮结果、也不在 manifest 的孤儿 strm（manifest 丢失、手工拷贝）
-    _clean_local_orphans(current)
 
     if sync_to_emby(cfg, OUT_ROOT):
         print(f"[SYNC] {total} strm -> {cfg['emby_container']}:/", flush=True)
