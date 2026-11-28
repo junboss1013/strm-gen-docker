@@ -6,7 +6,7 @@
 services:
   strm-gen:
     container_name: strm-gen
-    image: bossjun/strm-gen:1.0.9
+    image: bossjun/strm-gen:1.1.0
     # ghcr.io/junboss1013/strm-gen:latest 也可用（需先在网页把包设为 Public）
     # 本地改完代码想自用时，改用下面两行代替 image：
     # build: .
@@ -69,6 +69,14 @@ services:
       # ---- 增量合并：写入前不清空目标目录，保留已有历史 strm ----
       # 目标目录「每日更新」里已有大量历史 strm，必须开合并模式，否则会被清空
       MERGE_MODE: "true"
+
+      # ---- 删除同步：115 上删掉的影视，媒体库同步删除 ----
+      # 原理：每轮把「本工具生成过的 strm 清单」存到 /out/.strm_manifest.json，
+      # 下一轮对比，源里没有的就删 strm + 删对应 Emby 条目 + 清空目录。
+      # 安全阀：首次运行只建基线不删；单轮删除比例超阈值就跳过，避免挂载抖动误删整库。
+      PRUNE_ENABLED: "true"
+      PRUNE_MAX_PERCENT: "50"        # 单轮最多删全库的百分之多少，超了就跳过（大清理时临时调大）
+      PRUNE_DELETE_EMBY: "true"      # 同时删除 Emby 条目（只删 strm 的话 Emby 会留空壳）
 
       # ---- 目录映射：加新目录就在这里加一条 ----
       # type 取 movie 或 tv；emby_path 必须是 Emby 媒体库已扫描的路径

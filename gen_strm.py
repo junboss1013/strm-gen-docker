@@ -7,6 +7,7 @@
 - 经 docker.sock 用 tar 管道写入 Emby 容器媒体目录
   （兼容飞牛/老G速装里 /media 为容器内层叠 loop 镜像、宿主机无对应目录的情况）
 - 可选触发 Emby 媒体库刷新
+- 源文件删除后自动清理对应 strm 与 Emby 条目（manifest 对账）
 
 新增挂载目录：只改 compose 里的 MAPPINGS（加一条映射），重启/重跑即可。
 也可挂载 config.json 并用 CONFIG_FILE 指向它来配置。
@@ -18,18 +19,37 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 OUT_ROOT = os.environ.get("OUT_ROOT", "/out")
+MANIFEST_FILE = os.environ.get("STRM_MANIFEST_FILE", "/out/.strm_manifest.json")
 SCAN_STATE_FILE = "/out/.emby_scan_state.json"
 VIDEO_EXT = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
     ".ts", ".m2ts", ".iso", ".rmvb", ".vob", ".mpg", ".mpeg",
 }
 
+# ---- 删除同步（源文件消失 → 删 strm + 删 Emby 条目）----
+PRUNE_ENABLED = os.environ.get("PRUNE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+PRUNE_MAX_PERCENT = float(os.environ.get("PRUNE_MAX_PERCENT", "50") or 50)
+PRUNE_DELETE_EMBY = os.environ.get("PRUNE_DELETE_EMBY", "1").strip().lower() not in ("0", "false", "no", "off")
+
 TOKEN = None
 ALIST = ""
+
+# 分辨率标记，避免被误当成集号
+_RES_MARKERS = {"480", "576", "720", "1080", "2160", "4320", "540", "360"}
+
+# 网盘广告尾巴
+_AD_PATTERNS = [
+    r"【[^】]{0,60}(?:更多|访问|关注|公众号|资源|网址|www|http)[^】]{0,60}】",
+    r"\[[^\]]{0,60}(?:更多|访问|关注|公众号|www\.|https?://)[^\]]{0,60}\]",
+    r"https?://\S+",
+    r"www\.[^\s\]\)]+",
+    r"(?:更多高清|高清资源|请访问|关注公众号|扫描二维码)[^\s\]\)]*",
+]
 
 
 def _env(name, default=None, required=False):
@@ -120,17 +140,68 @@ def is_video(name):
     return os.path.splitext(name)[1].lower() in VIDEO_EXT
 
 
-def gen_se(name, fallback):
-    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,4})", name)
+def parse_se(text):
+    """从文件名/目录名解析 (季, 集)，解析不到返回 (None, None)。
+
+    支持的写法（按优先级）：
+      S02E178 / S02.E178 / S02EP178 / S02 E178
+      第2季 第178集 / 第178集 / 第178话
+      Season 2 - 178 / Season 2 Episode 178
+      EP178 / E178 / Ep.178
+      剧名 - 178 / 剧名.178（结尾独立数字，排除年份与分辨率）
+    """
+    if not text:
+        return None, None
+    s = os.path.splitext(text)[0]
+    # 纯季目录名（Season 02 / S02 / 第2季）：只表达季，不表达集
+    m = re.fullmatch(r"(?i)\s*(?:season|s)\s*(\d{1,2})\s*", s)
+    if m:
+        return int(m.group(1)), None
+    m = re.fullmatch(r"\s*第\s*(\d{1,2})\s*季\s*", s)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r"(?i)(?<![a-z])s(\d{1,2})\s*[.\-_ ]?\s*e[p]?\s*[.\-_ ]?(\d{1,4})(?!\d)", s)
     if m:
         return int(m.group(1)), int(m.group(2))
-    m = re.search(r"[Ee][Pp]?(\d{1,4})", name)
+    # 1x05 这种写法（排除 1920x1080 之类的分辨率）
+    m = re.search(r"(?<![a-z\d])(\d{1,2})[xX](\d{1,4})(?!\d)", s)
     if m:
-        return 1, int(m.group(1))
-    m = re.search(r"第\s*(\d{1,4})\s*集", name)
+        _se, _ep = int(m.group(1)), int(m.group(2))
+        if _ep <= 999 and not (1900 <= _ep <= 2100) and str(_ep) not in _RES_MARKERS:
+            return _se, _ep
+    m = re.search(r"第\s*(\d{1,2})\s*季.*?第\s*(\d{1,4})\s*[集话回]", s)
     if m:
-        return 1, int(m.group(1))
-    return 1, fallback
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"第\s*(\d{1,4})\s*[集话回]", s)
+    if m:
+        return None, int(m.group(1))
+    m = re.search(r"(?i)season\s*(\d{1,2})\s*(?:[-–—_.: ]+|episode\s*)\s*(\d{1,4})(?!\d)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"(?i)(?<![a-z])(?:episode|ep)\s*[.\-_ ]?\s*(\d{1,4})(?!\d)", s)
+    if m:
+        n = int(m.group(1))
+        if 0 < n <= 9999:
+            return None, n
+    m = re.search(r"(?i)(?<![a-z])e\s*[.\-_ ]?(\d{1,4})(?!\d)", s)
+    if m:
+        n = int(m.group(1))
+        if 0 < n <= 9999:
+            return None, n
+    for m in re.finditer(r"(?:[-–—._ ]|\b)\s*(\d{1,4})\s*(?=[\[\]()\s]|$)", s):
+        n = int(m.group(1))
+        if n <= 0 or n > 999:
+            continue
+        if 1900 <= n <= 2100 or str(n) in _RES_MARKERS:
+            continue
+        return None, n
+    return None, None
+
+
+def gen_se(name, fallback=1):
+    """兼容旧调用：返回 (季, 集)。"""
+    s, e = parse_se(name)
+    return (s or 1), (e or fallback)
 
 
 def walk(path, rel=""):
@@ -151,7 +222,59 @@ def clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def strip_ads(s):
+    out = s
+    for pat in _AD_PATTERNS:
+        out = re.sub(pat, "", out, flags=re.I)
+    out = clean(out)
+    # 去完广告后可能只剩分隔符
+    out = re.sub(r"^[\s\-_.]+|[\s\-_.]+$", "", out)
+    return out
+
+
+def safe_filename(name, limit=220):
+    """截断到不超过 limit 字节（UTF-8），保证不超 ext4 的 255 字节限制。"""
+    if len(name.encode("utf-8")) <= limit:
+        return name
+    stem, ext = os.path.splitext(name)
+    budget = limit - len(ext.encode("utf-8"))
+    out = []
+    used = 0
+    for ch in stem:
+        n = len(ch.encode("utf-8"))
+        if used + n > budget:
+            break
+        out.append(ch)
+        used += n
+    return "".join(out) + ext
+
+
+def _tidy_ep_title(title, series, season=None, ep=None):
+    """单集标题：去广告、去与文件名重复的信息。"""
+    t = strip_ads(title)
+    if not t:
+        return ""
+    if t == series:
+        return ""
+    # 标题里常重复剧名
+    if series and t.startswith(series):
+        t = t[len(series):].strip(" -_.·")
+    # 「Season 2 - 178」「S02E178」这类已由文件名本身表达
+    if season is not None and ep is not None:
+        for pat in (
+            r"(?i)^season\s*\d{1,2}\s*[-–—_.:]?\s*%d\b" % ep,
+            r"(?i)^s\d{1,2}\s*[.\-_ ]?e?p?\s*%d\b" % ep,
+            r"^第\s*%d\s*[集话回]" % ep,
+        ):
+            t2 = re.sub(pat, "", t).strip(" -_.·")
+            if t2 != t:
+                t = t2
+                break
+    return t
+
+
 def process(cfg, mapping, root):
+    """生成某个映射的 strm。返回 (数量, 容器内绝对路径列表)。"""
     src, dtype, target = mapping["alist_path"], mapping["type"], mapping["emby_path"]
     public_prefix = cfg["public_prefix"]
     if not public_prefix:
@@ -160,27 +283,54 @@ def process(cfg, mapping, root):
     out = os.path.join(root, target.strip("/"))
     os.makedirs(out, exist_ok=True)
     cnt = 0
+    written = []
+    ep_counter = {}   # (series, season) -> 下一个可用集号（解析失败时兜底）
+    fallback_n = 0
+
     for rel, name, full in walk(src):
         if dtype == "movie":
             folder = rel.split(os.sep)[0] if os.sep in rel else clean(os.path.splitext(name)[0])
             md = os.path.join(out, folder)
             os.makedirs(md, exist_ok=True)
-            sp = os.path.join(md, clean(os.path.splitext(name)[0]) + ".strm")
+            sp = os.path.join(md, safe_filename(clean(os.path.splitext(name)[0]) + ".strm"))
         else:
-            parts = rel.split(os.sep)
+            parts = [p for p in rel.split(os.sep) if p] if rel else []
             series = parts[0] if parts else "未知剧集"
             sdir = parts[1] if len(parts) >= 2 and re.match(
-                r"(?i)season|第.{1,3}季|S\d", parts[1]
+                r"(?i)season|第.{1,3}季|^s\d", parts[1]
             ) else None
-            season, ep = gen_se(name, 1)
+
+            # 集号：先看文件名；文件名里没有再看它所在目录名（每集一个文件夹的资源很常见）
+            f_season, f_ep = parse_se(name)
+            if f_ep is None and parts and parts[-1] != sdir:
+                p_season, p_ep = parse_se(parts[-1])
+                if p_ep is not None:
+                    f_season, f_ep = p_season, p_ep
+            season = f_season or 1
             if sdir:
                 sm = re.search(r"(\d+)", sdir)
                 if sm:
                     season = int(sm.group(1))
+
+            if f_ep is None:
+                # 兜底：按出现顺序递增，绝不让多集挤到同一集号上
+                key = (series, season)
+                ep = ep_counter.get(key, 1)
+                ep_counter[key] = ep + 1
+                fallback_n += 1
+                tag = f"未识别集号，按顺序记为 E{ep}"
+                print(f"  [WARN] {rel}/{name} {tag}", flush=True)
+            else:
+                ep = f_ep
+
             ed = os.path.join(out, series, f"Season {season}")
             os.makedirs(ed, exist_ok=True)
-            ep_title = clean(os.path.splitext(name)[0])
-            sp = os.path.join(ed, f"{series} - S{season:02d}E{ep:02d} - {ep_title}.strm")
+            ep_title = _tidy_ep_title(os.path.splitext(name)[0], series, season, ep)
+            base = f"{series} - S{season:02d}E{ep:02d}"
+            if ep_title:
+                base += f" - {ep_title}"
+            sp = os.path.join(ed, safe_filename(base + ".strm"))
+
         url = direct_url(public_prefix, full)
         # 【关键优化】内容未变时不重写文件，保住原 mtime。
         # Emby 扫描是按 (mtime, size) 判断文件是否变化；之前每次同步都覆盖全部 strm，
@@ -191,13 +341,230 @@ def process(cfg, mapping, root):
                 with open(sp, encoding="utf-8") as f:
                     if f.read() == url:
                         cnt += 1
+                        written.append(sp)
                         continue
             except Exception:
                 pass
         with open(sp, "w", encoding="utf-8") as f:
             f.write(url)
         cnt += 1
-    return cnt
+        written.append(sp)
+
+    if fallback_n:
+        print(f"  [WARN] {mapping['alist_path']} 有 {fallback_n} 个文件没解析出集号，已按顺序编号", flush=True)
+    # 转成 Emby 容器内绝对路径
+    container_paths = []
+    for p in written:
+        relp = os.path.relpath(p, root)
+        container_paths.append("/" + relp.replace(os.sep, "/"))
+    return cnt, container_paths
+
+
+def load_manifest():
+    try:
+        with open(MANIFEST_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        paths = d.get("paths") or {}
+        return paths if isinstance(paths, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_manifest(paths):
+    try:
+        os.makedirs(os.path.dirname(MANIFEST_FILE) or ".", exist_ok=True)
+        tmp = MANIFEST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), "paths": paths}, f, ensure_ascii=False)
+        os.replace(tmp, MANIFEST_FILE)
+    except Exception as e:
+        print(f"  [WARN] 写 manifest 失败: {e}", flush=True)
+
+
+def _docker_rm_files(container, paths, batch=200):
+    """在 Emby 容器里批量删除文件（NUL 分隔，兼容空格与中文）。"""
+    if not paths:
+        return 0
+    ok = 0
+    for i in range(0, len(paths), batch):
+        chunk = paths[i:i + batch]
+        payload = b"\0".join(p.encode("utf-8") for p in chunk) + b"\0"
+        r = subprocess.run(
+            ["docker", "exec", "-i", container, "xargs", "-0", "rm", "-f", "--"],
+            input=payload, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        if r.returncode == 0:
+            ok += len(chunk)
+            continue
+        # 回退：逐条删除
+        for p in chunk:
+            rc = subprocess.run(
+                ["docker", "exec", container, "rm", "-f", "--", p],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode
+            ok += 1 if rc == 0 else 0
+    return ok
+
+
+def _docker_dir_has_strm(container, dir_path):
+    """目录里是否还有 strm。
+
+    返回 True=还有，False=确认没有，None=检查失败。
+    三态很重要：容器不可用 / docker 报错时绝不能当成「空了」去删目录，
+    否则一次命令失败就可能连整部剧的目录和 Emby 条目一起删掉。
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "exec", container, "sh", "-c",
+             'find "$1" -maxdepth 4 -name "*.strm" -print -quit', "_", dir_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
+        )
+    except Exception:
+        return None
+    if r.returncode == 0:
+        return bool((r.stdout or "").strip())
+    err = (r.stderr or "").lower()
+    if "no such file" in err or "not found" in err:
+        return False
+    print(f"[PRUNE]   目录检查失败（不删除）{dir_path}: {(r.stderr or '').strip()[:120]}", flush=True)
+    return None
+
+
+def _docker_rm_tree(container, dir_path):
+    subprocess.run(
+        ["docker", "exec", container, "rm", "-rf", "--", dir_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _emby_lookup(base, h, paths, workers=8):
+    """按 Path 反查 Emby 条目 ID。"""
+    def one(p):
+        try:
+            r = requests.get(base + "/Items", headers=h,
+                             params={"Path": p, "Recursive": "false", "Fields": "Path"},
+                             timeout=30)
+            items = (r.json() or {}).get("Items") or []
+            return [it.get("Id") for it in items if it.get("Id")]
+        except Exception:
+            return []
+    ids = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(one, paths):
+            ids.extend(res)
+    return ids
+
+
+def _emby_delete_items(base, h, ids, workers=4):
+    def one(i):
+        try:
+            r = requests.delete(base + f"/Items/{i}", headers=h, timeout=30)
+            return r.status_code in (200, 204)
+        except Exception:
+            return False
+    ok = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(one, ids):
+            ok += 1 if res else 0
+    return ok
+
+
+def prune_removed(cfg, current):
+    """对账：上一轮有、本轮没有的 strm → 删除文件 + 删除 Emby 条目 + 清空目录。
+
+    返回 (已删除数量, 本轮跳过删除的路径)，跳过的路径要合并回 manifest，
+    否则下一轮就没有基线了，这些失效文件会被永久遗忘。
+
+    安全阀：
+      - 首次运行没有 manifest 时只记录，不删任何东西
+      - 某映射本轮 0 个 strm（Alist 异常）→ 跳过该映射
+      - 单轮删除比例超过 PRUNE_MAX_PERCENT → 跳过并告警，避免挂载抖动误删整库
+    """
+    if not PRUNE_ENABLED:
+        print("[PRUNE] 已关闭（PRUNE_ENABLED=0）", flush=True)
+        return 0, {}
+    old = load_manifest()
+    if not old:
+        print("[PRUNE] 首次运行，仅建立基线，不执行删除", flush=True)
+        return 0, {}
+
+    container = cfg["emby_container"]
+    total_del = 0
+    skipped = {}
+    for key, old_paths in old.items():
+        cur = set(current.get(key) or [])
+        if not cur:
+            print(f"[PRUNE] {key} 本轮 0 个 strm，判定为源异常，跳过删除", flush=True)
+            skipped[key] = list(old_paths or [])
+            continue
+        removed = [p for p in (old_paths or []) if p not in cur]
+        if not removed:
+            continue
+        pct = 100.0 * len(removed) / max(len(old_paths or []), 1)
+        if pct > PRUNE_MAX_PERCENT:
+            print(f"[PRUNE] {key} 待删 {len(removed)}/{len(old_paths)}（{pct:.0f}%）"
+                  f" 超过阈值 {PRUNE_MAX_PERCENT:.0f}%，本轮跳过。"
+                  f"确认无误可调大 PRUNE_MAX_PERCENT 或置 100", flush=True)
+            skipped[key] = removed
+            continue
+
+        print(f"[PRUNE] {key} 源已删除 {len(removed)} 个（{pct:.1f}%），开始清理", flush=True)
+        n = _docker_rm_files(container, removed)
+        total_del += n
+        print(f"[PRUNE]   删除 strm 文件 {n}/{len(removed)}", flush=True)
+
+        # 删除对应的 Emby 条目（ValidationOnly 扫描不会移除已消失文件的条目，必须显式删）
+        base = (cfg.get("emby_public") or "").rstrip("/")
+        h = {"X-Emby-Token": cfg.get("emby_api_key") or ""}
+        can_emby = bool(PRUNE_DELETE_EMBY and base and cfg.get("emby_api_key"))
+        if can_emby:
+            ids = _emby_lookup(base, h, removed)
+            if ids:
+                ok = _emby_delete_items(base, h, ids)
+                print(f"[PRUNE]   删除 Emby 条目 {ok}/{len(ids)}", flush=True)
+            else:
+                print("[PRUNE]   未在 Emby 找到对应条目（可能本就没入库）", flush=True)
+
+        # 清理整部剧/整部电影目录：目录里已无 strm 就整目录删掉，避免留下空壳
+        protected = {"/" + str(m.get("emby_path", "")).strip("/") for m in cfg.get("mappings", [])}
+
+        def _is_season_dir(name):
+            return bool(re.match(r"(?i)^(?:season\s*\d{1,2}|第.{1,3}季|s\d{1,2})$", name))
+
+        # 先逐季检查（整季被删时 Season 会变空季，需要单独清）
+        season_dirs = set()
+        for p in removed:
+            d = os.path.dirname(p)
+            if _is_season_dir(os.path.basename(d)):
+                season_dirs.add(d)
+        for d in sorted(season_dirs):
+            if _docker_dir_has_strm(container, d) is False:
+                print(f"[PRUNE]   清理空季 {d}", flush=True)
+                _docker_rm_tree(container, d)
+                if can_emby:
+                    ids = _emby_lookup(base, h, [d])
+                    if ids:
+                        _emby_delete_items(base, h, ids)
+
+        tops = set()
+        for p in removed:
+            d = os.path.dirname(p)
+            # 剧集是 剧名/Season N/xxx.strm → 上提到剧名目录；电影是 片名/xxx.strm → 就是片名目录
+            if _is_season_dir(os.path.basename(d)):
+                d = os.path.dirname(d)
+            tops.add(d)
+        for d in sorted(tops):
+            if not d or d.count("/") < 2 or d in protected:
+                continue
+            if _docker_dir_has_strm(container, d) is False:
+                print(f"[PRUNE]   清理空目录 {d}", flush=True)
+                _docker_rm_tree(container, d)
+                if can_emby:
+                    ids = _emby_lookup(base, h, [d])
+                    if ids:
+                        _emby_delete_items(base, h, ids)
+                        print(f"[PRUNE]   删除空壳条目 {len(ids)} 个", flush=True)
+    return total_del, skipped
 
 
 def sync_to_emby(cfg, root):
@@ -294,7 +661,7 @@ def trigger_scan(cfg):
       POST /Items/{folderId}/Refresh?Recursive=true
            &MetadataRefreshMode=ValidationOnly&ImageRefreshMode=ValidationOnly
     只校验文件、发现新增，不请求外部元数据源 —— 实测 15 秒完成，新文件立即入库。
-    元数据可在 Emby 里对该剧单独「识别/刷新」补全。
+    注意：该模式不会移除「文件已消失」的条目，删除同步由 prune_removed() 显式处理。
     """
     if not cfg["emby_public"] or not cfg["emby_api_key"]:
         return False
@@ -356,9 +723,13 @@ def trigger_scan(cfg):
 def main():
     cfg = load_config()
     login(cfg)
-    # OUT_ROOT 通常是挂载卷，不能直接删除目录本身（Resource busy），只清空其内容
+    # OUT_ROOT 通常是挂载卷，不能直接删除目录本身（Resource busy），只清空其内容。
+    # 注意保留隐藏状态文件（.strm_manifest.json / .emby_scan_state.json）：它们是持久状态，
+    # 清掉会导致对账基线丢失、扫描自愈与补刮冷却失效。
     os.makedirs(OUT_ROOT, exist_ok=True)
     for entry in os.listdir(OUT_ROOT):
+        if entry.startswith("."):
+            continue
         p = os.path.join(OUT_ROOT, entry)
         if os.path.isdir(p) and not os.path.islink(p):
             import shutil
@@ -366,12 +737,30 @@ def main():
         else:
             os.remove(p)
     total = 0
+    current = {}
     for m in cfg["mappings"]:
-        n = process(cfg, m, OUT_ROOT)
+        n, paths = process(cfg, m, OUT_ROOT)
         total += n
+        current["/" + str(m["emby_path"]).strip("/")] = paths
         print(f"[OK] {m['alist_path']} -> {m['emby_path']} : {n} strm", flush=True)
+
     if sync_to_emby(cfg, OUT_ROOT):
         print(f"[SYNC] {total} strm -> {cfg['emby_container']}:/", flush=True)
+
+    # 源文件已删除 → 清理 strm 与 Emby 条目
+    try:
+        d, skipped = prune_removed(cfg, current)
+        if d:
+            print(f"[PRUNE] 共清理 {d} 个失效 strm", flush=True)
+        # 本轮跳过的失效路径要留在 manifest 里，否则下轮丢基线、永久遗忘
+        for k, ps in (skipped or {}).items():
+            merged = list(dict.fromkeys(list(current.get(k) or []) + list(ps)))
+            current[k] = merged
+    except Exception as e:
+        print(f"[PRUNE] 清理失败（不影响入库）: {e}", flush=True)
+
+    save_manifest(current)
+
     if cfg["auto_scan"]:
         try:
             if trigger_scan(cfg):
