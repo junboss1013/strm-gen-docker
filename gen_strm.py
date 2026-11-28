@@ -659,6 +659,31 @@ def _grep_managed(container, target, prefixes):
     return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
 
 
+def _settle_deletions(cfg, dirs, rounds=2, wait=4):
+    """删完条目后复核目录，清掉 Emby 回写/重建留下的空壳。
+
+    Emby 删除 Series 的过程中会往剧目录写 tvshow.nfo，排队中的扫描也可能把条目重建；
+    只删一次目录就会留下「目录存在但没有 strm」的空壳，媒体库里表现为点开报错。
+    这里隔几秒再核一轮，幂等。
+    """
+    if not dirs:
+        return
+    container = cfg["emby_container"]
+    for _ in range(rounds):
+        time.sleep(wait)
+        alive = [d for d in dirs if _docker_dir_has_strm(container, d) is not False]
+        if not alive:
+            return
+        if PRUNE_DELETE_EMBY:
+            try:
+                _emby_remove_for_paths(cfg, [], alive)
+            except Exception:
+                pass
+        for d in alive:
+            if _docker_dir_has_strm(container, d) is False:
+                _docker_rm_tree(container, d)
+
+
 def prune_removed(cfg, current):
     """对账：上一轮有、本轮没有的 strm → 删除文件 + 删除 Emby 条目 + 清空目录。
 
@@ -763,11 +788,9 @@ def prune_removed(cfg, current):
             if not d or d.count("/") < 2 or d in protected:
                 continue
             if _docker_dir_has_strm(container, d) is False:
-                print(f"[PRUNE]   清理空目录 {d}", flush=True)
-                _docker_rm_tree(container, d)
                 empty_tops.append(d)
 
-        # 删 Emby 条目（ValidationOnly 扫描不会移除已消失文件的条目，必须显式删）
+        # 先删 Emby 条目（ValidationOnly 扫描不会移除已消失文件的条目，必须显式删）
         if PRUNE_DELETE_EMBY:
             try:
                 de, ds = _emby_remove_for_paths(cfg, removed, empty_tops)
@@ -777,6 +800,14 @@ def prune_removed(cfg, current):
                     print("[PRUNE]   Emby 里没有需要删除的条目", flush=True)
             except Exception as e:
                 print(f"[PRUNE]   删除 Emby 条目失败（忽略）: {e}", flush=True)
+
+        # 删目录必须排在「删条目」之后：Emby 删 Series 时会往剧目录回写 tvshow.nfo，
+        # 甚至让排队中的扫描把刚删掉的条目重建一遍。先删目录就会留下一个「空剧壳」。
+        for d in empty_tops:
+            if _docker_dir_has_strm(container, d) is False:
+                print(f"[PRUNE]   清理空目录 {d}", flush=True)
+                _docker_rm_tree(container, d)
+        _settle_deletions(cfg, empty_tops)
     return total_del, skipped
 
 
