@@ -129,6 +129,10 @@ URL 不匹配，一条都不会被动。
 
 ## 用 MoviePilot 整理 115 存量：联动操作手册
 
+> 已经跑通了，工具包部署在 `/vol1/1000/docker/moviepilot/strm-conventions/`：
+> `organize115.py`（列剧/预览/整理）、`restore_config.py`（配置回写）、
+> `rebuild_strm.sh`（整理后收尾）。下面是他背后的原理和踩过的坑。
+
 MoviePilot v3 能直接读写 115（`type: u115`），可以把 `/影视库/电视剧` 下命名混乱的资源
 原地重命名成 `剧名 (年份)/Season 01/剧名 - S01E01.mkv`。整理完 strm-gen 会自动跟随，
 但**顺序错了会留下一堆僵尸条目**，所以按下面走。
