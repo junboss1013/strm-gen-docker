@@ -285,6 +285,24 @@ def _tidy_ep_title(title, series, season=None, ep=None):
     return t
 
 
+def _emit_strm(sp, url):
+    """写 strm 文件；内容未变则跳过写入。
+
+    【关键】保住原 mtime。Emby 按 (mtime, size) 判断文件是否变化，每次同步都
+    覆盖全部 strm 会让 mtime 全刷新，Emby 每次把上万个 strm 当新文件重新探测
+    远程直链（单个 1~10 秒），扫描数小时且极易卡死。
+    """
+    if os.path.exists(sp):
+        try:
+            with open(sp, encoding="utf-8") as f:
+                if f.read() == url:
+                    return
+        except Exception:
+            pass
+    with open(sp, "w", encoding="utf-8") as f:
+        f.write(url)
+
+
 def process(cfg, mapping, root):
     """生成某个映射的 strm。返回 (数量, 容器内绝对路径列表)。"""
     src, dtype, target = mapping["alist_path"], mapping["type"], mapping["emby_path"]
@@ -298,6 +316,7 @@ def process(cfg, mapping, root):
     written = []
     ep_counter = {}   # (series, season) -> 下一个可用集号（解析失败时兜底）
     fallback_n = 0
+    pending_fb = []   # 未识别出集号的文件：(series, season, name, full)，等全剧解析完再分配号
 
     for rel, name, full in walk(src):
         if dtype == "movie":
@@ -325,15 +344,15 @@ def process(cfg, mapping, root):
                     season = int(sm.group(1))
 
             if f_ep is None:
-                # 兜底：按出现顺序递增，绝不让多集挤到同一集号上
-                key = (series, season)
-                ep = ep_counter.get(key, 1)
-                ep_counter[key] = ep + 1
-                fallback_n += 1
-                tag = f"未识别集号，按顺序记为 E{ep}"
-                print(f"  [WARN] {rel}/{name} {tag}", flush=True)
+                # 未识别集号：先挂起。绝不能立刻从 E1 开始编号 —— 那会跟真实的
+                # 第一集撞名，把 E1/E2 的 strm 覆盖成花絮/整季合集文件。
+                # 等本剧所有文件的集号都解析完，再从「最大集号 + 1」往后分配。
+                pending_fb.append((series, season, name, full))
+                continue
             else:
                 ep = f_ep
+                key = (series, season)
+                ep_counter[key] = max(ep_counter.get(key, 1), ep + 1)
 
             ed = os.path.join(out, series, f"Season {season}")
             os.makedirs(ed, exist_ok=True)
@@ -344,21 +363,25 @@ def process(cfg, mapping, root):
             sp = os.path.join(ed, safe_filename(base + ".strm"))
 
         url = direct_url(public_prefix, full)
-        # 【关键优化】内容未变时不重写文件，保住原 mtime。
-        # Emby 扫描是按 (mtime, size) 判断文件是否变化；之前每次同步都覆盖全部 strm，
-        # mtime 全被刷新，导致 Emby 每次都把上万个 strm 当成新文件重新探测远程直链
-        # （单个 1~10 秒），扫描要数小时且极易卡死。保持 mtime 后 Emby 只处理真正新增的文件。
-        if os.path.exists(sp):
-            try:
-                with open(sp, encoding="utf-8") as f:
-                    if f.read() == url:
-                        cnt += 1
-                        written.append(sp)
-                        continue
-            except Exception:
-                pass
-        with open(sp, "w", encoding="utf-8") as f:
-            f.write(url)
+        _emit_strm(sp, url)
+        cnt += 1
+        written.append(sp)
+
+    # 第二遍：给挂起的未识别文件分配号，从该剧已用最大集号往后排
+    for series, season, name, full in pending_fb:
+        key = (series, season)
+        ep = ep_counter.get(key, 1)
+        ep_counter[key] = ep + 1
+        fallback_n += 1
+        print(f"  [WARN] {series}/{name} 未识别集号，按顺序记为 E{ep}", flush=True)
+        ed = os.path.join(out, series, f"Season {season}")
+        os.makedirs(ed, exist_ok=True)
+        ep_title = _tidy_ep_title(os.path.splitext(name)[0], series, season, ep)
+        base = f"{series} - S{season:02d}E{ep:02d}"
+        if ep_title:
+            base += f" - {ep_title}"
+        sp = os.path.join(ed, safe_filename(base + ".strm"))
+        _emit_strm(sp, direct_url(public_prefix, full))
         cnt += 1
         written.append(sp)
 
